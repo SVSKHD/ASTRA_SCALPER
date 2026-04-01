@@ -3,19 +3,23 @@ from __future__ import annotations
 # =============================================================================
 # BACKTEST — fetch real MT5 M5 data, replay strategy logic bar by bar
 #
+# TIMING (confirmed from 2026-04-01.json + start_price.py):
+#   - MT5 UI runs UTC  →  date_mt5 = UTC date  →  day boundary = UTC midnight
+#   - lock_hhmm_mt5 = "00:00" UTC  →  start locked at first UTC tick after midnight
+#   - Server UTC+03 is display only — NOT used for any timing logic
+#   - Default: --server-offset 0 (UTC), --session-start 00:00 (UTC midnight)
+#
 # Usage:
-#   python backtest.py --capital 50000 --lot 2.5
-#   python backtest.py --capital 10000 --lot 0.5 --months 1
-#   python backtest.py --capital 100000 --lot 5.0 --months 2 --symbol XAUUSD
+#   python backtest.py --capital 50000 --lot 1.0 --months 1
+#   python backtest.py --capital 50000 --lot 2.5 --months 2
+#   python backtest.py --capital 100000 --lot 5.0 --months 1
 #   python backtest.py --help
 #
-# Intrabar execution model (FIXED):
-#   Each M5 bar is evaluated in this order:
-#   1. If position open → check bar HIGH/LOW for SL or TP hit
-#   2. If no position → check bar HIGH/LOW for entry cross
-#   3. If entry fires on this bar → immediately check same bar for SL/TP
-#      (price can enter AND exit within the same 5-min bar)
-#   4. Overshoot filter: if bar closes too far past entry, reject stale signal
+# Intrabar execution:
+#   1. Open position: check bar HIGH/LOW for TP/SL
+#   2. No position: check bar HIGH/LOW for entry cross (UTC session gate)
+#   3. Entry fires: check same bar for TP/SL (close-price tiebreaker)
+#   4. Overshoot filter: reject if bar.close too far past entry
 # =============================================================================
 
 import argparse
@@ -32,7 +36,7 @@ except ImportError:
     MT5_AVAILABLE = False
 
 from config import StrategyConfig
-from threshold import compute_levels, ThresholdLevels
+from threshold import compute_levels
 from trade_signal import Direction
 from risk_control import (
     RiskSnapshot, can_place_trade,
@@ -46,15 +50,24 @@ from risk_control import (
 
 @dataclass
 class Bar:
-    time:  datetime
-    open:  float
-    high:  float
-    low:   float
-    close: float
-    hhmm:  str = ""
+    time_utc:  datetime   # bar open time in UTC
+    open:      float
+    high:      float
+    low:       float
+    close:     float
+    utc_hhmm:  str = ""   # UTC HH:MM — used for ALL session/timing checks
 
     def __post_init__(self):
-        self.hhmm = self.time.strftime("%H:%M")
+        self.utc_hhmm = self.time_utc.strftime("%H:%M")
+
+    # Keep server_hhmm as alias for test compatibility
+    @property
+    def server_hhmm(self) -> str:
+        return self.utc_hhmm
+
+    def init_server_time(self, server_utc_offset: int):
+        """No-op kept for test compatibility. UTC offset ignored."""
+        pass
 
 
 @dataclass
@@ -64,10 +77,10 @@ class TradeRecord:
     entry_price: float
     tp_price:    float
     sl_price:    float
-    entry_bar:   str
+    entry_bar:   str          # UTC HH:MM
     exit_price:  float = 0.0
     exit_bar:    str   = ""
-    outcome:     str   = ""      # "TP" | "SL" | "FORCE_CLOSE"
+    outcome:     str   = ""   # "TP" | "SL" | "FORCE_CLOSE"
     gross_pnl:   float = 0.0
     spread_cost: float = 0.0
     net_pnl:     float = 0.0
@@ -75,8 +88,9 @@ class TradeRecord:
 
 @dataclass
 class DayReport:
-    date:        str
+    date:        str          # UTC date YYYY-MM-DD (= date_mt5 in real bot)
     start_price: float
+    lock_utc:    str = ""     # when start was locked (UTC HH:MM)
     trades:      list[TradeRecord] = field(default_factory=list)
     day_gross:   float = 0.0
     day_net:     float = 0.0
@@ -90,7 +104,8 @@ class DayReport:
 # MT5 FETCH
 # =============================================================================
 
-def fetch_bars(symbol: str, months: int, server_utc_offset: int = 2) -> list[Bar]:
+def fetch_bars(symbol: str, months: int) -> list[Bar]:
+    """Fetch M5 bars from MT5. All times stored as UTC."""
     if not MT5_AVAILABLE:
         raise RuntimeError("MetaTrader5 not installed.")
     if not mt5.initialize():
@@ -99,14 +114,14 @@ def fetch_bars(symbol: str, months: int, server_utc_offset: int = 2) -> list[Bar
     to_dt   = datetime.now(timezone.utc)
     from_dt = to_dt - timedelta(days=months * 31)
 
-    print(f"[BACKTEST] Fetching M5: {symbol} | {from_dt.date()} → {to_dt.date()}")
+    print(f"[BACKTEST] Fetching M5: {symbol} | {from_dt.date()} → {to_dt.date()} (UTC)")
     rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, from_dt, to_dt)
     if rates is None or len(rates) == 0:
-        raise RuntimeError(f"No M5 data for {symbol}. Check MT5 connection.")
+        raise RuntimeError(f"No M5 data for {symbol}.")
 
     bars = [
         Bar(
-            time  = datetime.fromtimestamp(int(r["time"]), tz=timezone.utc),
+            time_utc = datetime.fromtimestamp(int(r["time"]), tz=timezone.utc),
             open  = float(r["open"]),
             high  = float(r["high"]),
             low   = float(r["low"]),
@@ -118,20 +133,30 @@ def fetch_bars(symbol: str, months: int, server_utc_offset: int = 2) -> list[Bar
     return bars
 
 
-def group_by_day(bars: list[Bar], server_utc_offset: int = 2) -> dict[str, list[Bar]]:
-    offset  = timedelta(hours=server_utc_offset)
+# =============================================================================
+# GROUP BY UTC DATE  (matches date_mt5 in real bot JSON)
+# =============================================================================
+
+def group_by_day(
+    bars:              list[Bar],
+    server_utc_offset: int = 0,   # kept for signature compat, ignored (UTC is UTC)
+) -> dict[str, list[Bar]]:
+    """
+    Group bars by UTC calendar date.
+    This exactly matches date_mt5 in the real bot's JSON output.
+    """
     day_map: dict[str, list[Bar]] = defaultdict(list)
     for bar in bars:
-        key = (bar.time + offset).strftime("%Y-%m-%d")
+        key = bar.time_utc.strftime("%Y-%m-%d")   # UTC date
         day_map[key].append(bar)
     return dict(sorted(day_map.items()))
 
 
 # =============================================================================
-# INTRABAR EXECUTION ENGINE (FIXED)
+# INTRABAR EXECUTION ENGINE
 # =============================================================================
 
-SPREAD_PIP = 0.35   # typical XAUUSD spread
+SPREAD_PIP = 0.35
 
 
 def _spread_cost(lot_size: float) -> float:
@@ -156,224 +181,187 @@ def _check_exit_on_bar(
     entry_on_bar: bool = False,
 ) -> tuple[str, float] | None:
     """
-    Check if TP or SL is hit within a bar using high/low.
-    Returns (outcome, exit_price) or None if neither hit.
-
-    Conflict resolution (both TP and SL reachable on same bar):
-    - If this is the entry bar (entry_on_bar=True):
-        Use bar.close as tiebreaker — the close tells us which direction
-        the bar resolved toward after entry fired.
-        close >= tp → TP (price continued past entry toward TP)
-        close <= sl → SL (price reversed through SL)
-        otherwise   → SL (conservative)
-    - If this is a subsequent bar (entry_on_bar=False):
-        SL wins — worst-case assumption.
+    Check TP/SL hit using bar high/low.
+    Conflict (both hit same bar):
+    - entry_on_bar=True  → bar.close tiebreaker (close≥tp → TP, else SL for LONG)
+    - entry_on_bar=False → SL wins (worst-case)
     """
     if direction == "LONG":
         sl_hit = bar.low  <= sl
         tp_hit = bar.high >= tp
         if sl_hit and tp_hit:
-            if entry_on_bar:
-                if bar.close >= tp:
-                    return "TP", tp
-                return "SL", sl
-            return "SL", sl   # subsequent bar: worst case
-        if sl_hit:
-            return "SL", sl
-        if tp_hit:
-            return "TP", tp
+            return ("TP", tp) if (entry_on_bar and bar.close >= tp) else ("SL", sl)
+        if sl_hit: return "SL", sl
+        if tp_hit: return "TP", tp
     else:
         sl_hit = bar.high >= sl
         tp_hit = bar.low  <= tp
         if sl_hit and tp_hit:
-            if entry_on_bar:
-                if bar.close <= tp:
-                    return "TP", tp
-                return "SL", sl
-            return "SL", sl
-        if sl_hit:
-            return "SL", sl
-        if tp_hit:
-            return "TP", tp
+            return ("TP", tp) if (entry_on_bar and bar.close <= tp) else ("SL", sl)
+        if sl_hit: return "SL", sl
+        if tp_hit: return "TP", tp
     return None
 
 
 def _check_entry_on_bar(
-    direction:  Direction,
-    entry:      float,
-    bar:        Bar,
-    overshoot:  float,
+    direction: Direction,
+    entry:     float,
+    bar:       Bar,
+    overshoot: float,
 ) -> bool:
-    """
-    Check if bar crosses the entry level.
-    Uses bar HIGH for LONG entries, bar LOW for SHORT entries.
-    Overshoot filter: reject if bar close is more than overshoot pips past entry
-    (proxy for a stale fill on fast bars).
-    """
+    """Check if bar crosses entry. Reject if bar.close too far past entry."""
     if direction == "LONG":
-        if bar.high < entry:
-            return False
-        # Overshoot: bar closed too far above entry — stale fill
-        if bar.close - entry > overshoot:
-            return False
-        return True
+        return bar.high >= entry and (bar.close - entry) <= overshoot
     else:
-        if bar.low > entry:
-            return False
-        if entry - bar.close > overshoot:
-            return False
-        return True
+        return bar.low <= entry and (entry - bar.close) <= overshoot
 
+
+# =============================================================================
+# DAY SIMULATION
+# =============================================================================
 
 def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
+    """
+    Replay one UTC calendar day bar by bar.
+    Session times use UTC HH:MM — matching real bot lock_hhmm_mt5 = "00:00" UTC.
+    Start price locked at first bar with utc_hhmm >= session_start_hhmm.
+    """
     report          = DayReport(date=date, start_price=0.0)
     already_traded: set[Direction] = set()
     trade_count     = 0
     realized_pnl    = 0.0
     open_trade: TradeRecord | None = None
 
-    # ── LOCK START PRICE ────────────────────────────────────────────────────
+    # ── LOCK START PRICE ─────────────────────────────────────────────────────
+    # First bar at or after session_start_hhmm (UTC).
+    # With session_start_hhmm="00:00", this is the very first bar of the UTC day.
+    # This matches start_price.py: lock_hhmm_mt5="00:00" (UTC), locks first tick
+    # at or after UTC midnight.
     start_bar = next(
-        (b for b in bars if b.hhmm >= cfg.session_start_hhmm), None
+        (b for b in bars if b.utc_hhmm >= cfg.session_start_hhmm),
+        None
     )
     if start_bar is None:
         report.no_trigger = True
         return report
 
-    start_price       = start_bar.open
+    start_price        = start_bar.open
     report.start_price = start_price
-    levels            = compute_levels(start_price, cfg)
+    report.lock_utc    = start_bar.utc_hhmm
+    levels             = compute_levels(start_price, cfg)
 
-    # ── BAR REPLAY ──────────────────────────────────────────────────────────
+    # ── BAR REPLAY ───────────────────────────────────────────────────────────
     for bar in bars:
 
-        # Skip pre-session bars
-        if bar.hhmm < cfg.session_start_hhmm:
+        if bar.utc_hhmm < cfg.session_start_hhmm:
             continue
 
-        # Force-close time reached
-        if bar.hhmm >= cfg.force_close_hhmm:
+        # Force close (UTC)
+        if bar.utc_hhmm >= cfg.force_close_hhmm:
             if open_trade is not None:
                 ep    = bar.open
                 gross = _pnl(open_trade.direction, open_trade.entry_price, ep, cfg.lot_size)
                 sp    = _spread_cost(cfg.lot_size)
-                realized_pnl        += gross
-                open_trade.exit_price = ep
-                open_trade.exit_bar   = bar.hhmm
-                open_trade.outcome    = "FORCE_CLOSE"
-                open_trade.gross_pnl  = gross
-                open_trade.spread_cost= sp
-                open_trade.net_pnl    = round(gross - sp, 2)
+                realized_pnl           += gross
+                open_trade.exit_price   = ep
+                open_trade.exit_bar     = bar.utc_hhmm
+                open_trade.outcome      = "FORCE_CLOSE"
+                open_trade.gross_pnl    = gross
+                open_trade.spread_cost  = sp
+                open_trade.net_pnl      = round(gross - sp, 2)
                 open_trade = None
             break
 
-        # ── STEP 1: Resolve open position on this bar ────────────────────
+        # ── Step 1: Resolve existing position ────────────────────────────
         if open_trade is not None:
             result = _check_exit_on_bar(
-                open_trade.direction,
-                open_trade.entry_price,
-                open_trade.tp_price,
-                open_trade.sl_price,
-                bar,
-                entry_on_bar=False,   # opened on previous bar → SL wins conflict
+                open_trade.direction, open_trade.entry_price,
+                open_trade.tp_price, open_trade.sl_price,
+                bar, entry_on_bar=False,
             )
             if result is not None:
                 outcome, exit_price = result
                 gross = _pnl(open_trade.direction, open_trade.entry_price, exit_price, cfg.lot_size)
                 sp    = _spread_cost(cfg.lot_size)
-                realized_pnl         += gross
+                realized_pnl          += gross
                 open_trade.exit_price  = exit_price
-                open_trade.exit_bar    = bar.hhmm
+                open_trade.exit_bar    = bar.utc_hhmm
                 open_trade.outcome     = outcome
                 open_trade.gross_pnl   = gross
                 open_trade.spread_cost = sp
                 open_trade.net_pnl     = round(gross - sp, 2)
                 open_trade = None
 
-        # ── STEP 2: Check daily gates ────────────────────────────────────
+        # ── Step 2: Daily gates ───────────────────────────────────────────
         if is_daily_profit_hit(realized_pnl, cfg):
-            report.hit_profit = True
-            break
+            report.hit_profit = True; break
         if is_daily_limit_breached(realized_pnl, cfg):
-            report.hit_loss = True
-            break
+            report.hit_loss = True; break
         if trade_count >= cfg.max_trades_per_day:
             break
         if open_trade is not None:
             continue
 
-        # ── STEP 3: Check for new entry (both directions if mode=both) ───
+        # ── Step 3: New entry signal ──────────────────────────────────────
         mode = cfg.direction_mode
         if mode == "first_only" and already_traded:
             continue
 
-        directions_to_check: list[Direction] = []
-        if "LONG" not in already_traded:
-            directions_to_check.append("LONG")
-        if "SHORT" not in already_traded:
-            directions_to_check.append("SHORT")
+        dirs: list[Direction] = []
+        if "LONG"  not in already_traded: dirs.append("LONG")
+        if "SHORT" not in already_traded: dirs.append("SHORT")
 
-        for direction in directions_to_check:
-            entry  = levels.long_entry  if direction == "LONG"  else levels.short_entry
-            tp     = levels.long_tp     if direction == "LONG"  else levels.short_tp
-            sl     = levels.long_sl     if direction == "LONG"  else levels.short_sl
+        for direction in dirs:
+            entry = levels.long_entry  if direction == "LONG"  else levels.short_entry
+            tp    = levels.long_tp     if direction == "LONG"  else levels.short_tp
+            sl    = levels.long_sl     if direction == "LONG"  else levels.short_sl
 
             if not _check_entry_on_bar(direction, entry, bar, cfg.max_entry_overshoot_pips):
                 continue
 
-            # Risk gate
             snap = RiskSnapshot(
-                realized_pnl        = realized_pnl,
-                open_pnl            = 0.0,
-                trade_count         = trade_count,
-                open_position_count = 0,
+                realized_pnl=realized_pnl, open_pnl=0.0,
+                trade_count=trade_count, open_position_count=0,
             )
             allowed, _ = can_place_trade(snap, cfg)
             if not allowed:
                 continue
 
-            # Entry fires — record trade
             trade = TradeRecord(
-                day         = date,
-                direction   = direction,
-                entry_price = entry,
-                tp_price    = tp,
-                sl_price    = sl,
-                entry_bar   = bar.hhmm,
+                day=date, direction=direction,
+                entry_price=entry, tp_price=tp, sl_price=sl,
+                entry_bar=bar.utc_hhmm,
             )
             report.trades.append(trade)
             already_traded.add(direction)
             trade_count += 1
 
-            # ── STEP 4: Check same-bar TP/SL immediately ────────────────
-            # Price may have entered AND exited within this same M5 bar.
-            # Pass entry_on_bar=True so close price is used as tiebreaker.
+            # ── Step 4: Same-bar exit ─────────────────────────────────────
             result = _check_exit_on_bar(direction, entry, tp, sl, bar, entry_on_bar=True)
             if result is not None:
                 outcome, exit_price = result
                 gross = _pnl(direction, entry, exit_price, cfg.lot_size)
                 sp    = _spread_cost(cfg.lot_size)
-                realized_pnl     += gross
-                trade.exit_price  = exit_price
-                trade.exit_bar    = bar.hhmm
-                trade.outcome     = outcome
-                trade.gross_pnl   = gross
-                trade.spread_cost = sp
-                trade.net_pnl     = round(gross - sp, 2)
-                open_trade        = None
+                realized_pnl    += gross
+                trade.exit_price = exit_price
+                trade.exit_bar   = bar.utc_hhmm
+                trade.outcome    = outcome
+                trade.gross_pnl  = gross
+                trade.spread_cost= sp
+                trade.net_pnl    = round(gross - sp, 2)
+                open_trade       = None
             else:
                 open_trade = trade
 
-            # In first_only mode, stop after first entry
             if mode == "first_only":
                 break
 
-    # ── EOD: resolve any still-open position ────────────────────────────
+    # EOD close
     if open_trade is not None and bars:
         ep    = bars[-1].close
         gross = _pnl(open_trade.direction, open_trade.entry_price, ep, cfg.lot_size)
         sp    = _spread_cost(cfg.lot_size)
-        realized_pnl         += gross
+        realized_pnl          += gross
         open_trade.exit_price  = ep
         open_trade.exit_bar    = "EOD"
         open_trade.outcome     = "FORCE_CLOSE"
@@ -381,14 +369,11 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
         open_trade.spread_cost = sp
         open_trade.net_pnl     = round(gross - sp, 2)
 
-    # Day totals
     report.day_gross  = round(sum(t.gross_pnl   for t in report.trades), 2)
     report.day_spread = round(sum(t.spread_cost  for t in report.trades), 2)
     report.day_net    = round(report.day_gross - report.day_spread, 2)
-
     if not report.trades:
         report.no_trigger = True
-
     return report
 
 
@@ -396,14 +381,9 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
 # REPORT PRINTER
 # =============================================================================
 
-W = 76
+W = 82
 
-def print_report(
-    reports: list[DayReport],
-    cfg:     StrategyConfig,
-    months:  int,
-    symbol:  str,
-):
+def print_report(reports: list[DayReport], cfg: StrategyConfig, months: int, symbol: str):
     total_gross  = sum(r.day_gross  for r in reports)
     total_spread = sum(r.day_spread for r in reports)
     total_net    = sum(r.day_net    for r in reports)
@@ -413,57 +393,61 @@ def print_report(
     all_sl = sum(1 for r in reports for t in r.trades if t.outcome == "SL")
     all_fc = sum(1 for r in reports for t in r.trades if t.outcome == "FORCE_CLOSE")
 
-    win_days     = [r for r in reports if r.day_net > 0]
-    loss_days    = [r for r in reports if r.day_net < 0]
-    no_trig_days = [r for r in reports if r.no_trigger]
-    profit_days  = [r for r in reports if r.hit_profit]
-    loss_lim_days= [r for r in reports if r.hit_loss]
+    win_days      = [r for r in reports if r.day_net > 0]
+    loss_days     = [r for r in reports if r.day_net < 0]
+    no_trig_days  = [r for r in reports if r.no_trigger]
+    profit_days   = [r for r in reports if r.hit_profit]
+    loss_lim_days = [r for r in reports if r.hit_loss]
 
     win_rate    = (all_tp / total_trades * 100) if total_trades else 0
     roi         = (total_net / cfg.account_size * 100) if cfg.account_size else 0
     active_days = len(reports) - len(no_trig_days)
-    avg_per_day = (total_net / active_days) if active_days else 0
+    avg_per_day = total_net / active_days if active_days else 0
 
-    bar = "═" * W
+    sep = "═" * W
     thn = "─" * W
 
-    print()
-    print(f"╔{bar}╗")
+    print(f"\n╔{sep}╗")
     print(f"║{'BACKTEST REPORT — XAUUSD THRESHOLD STRATEGY':^{W}}║")
-    print(f"╠{bar}╣")
-    print(f"║  Symbol: {symbol}  │  Period: {months}m  │  Account: ${cfg.account_size:,.0f}  │  Lot: {cfg.lot_size}  │  Entry: 1.1×={cfg.entry_offset}pip  Exit: 1.2×={cfg.exit_offset}pip".ljust(W) + "  ║")
-    print(f"╠{bar}╣")
-    print(f"║{'DAY-BY-DAY':^{W}}║")
+    print(f"╠{sep}╣")
+    print(f"║  {symbol}  {months}m  ${cfg.account_size:,.0f}  lot={cfg.lot_size}  "
+          f"Entry=S±{cfg.entry_offset}  TP=S±{cfg.exit_offset}  SL=S±{cfg.breakout_offset}  "
+          f"Session={cfg.session_start_hhmm}–{cfg.session_end_hhmm} UTC".ljust(W+1) + "║")
+    print(f"╠{sep}╣")
+    print(f"║{'DAY-BY-DAY  (all times UTC — matches date_mt5 and lock_hhmm_mt5)':^{W}}║")
     print(f"╠{thn}╣")
 
     for r in reports:
         if r.no_trigger:
-            print(f"║  {r.date}  S={r.start_price:.2f}  No signal triggered".ljust(W) + "  ║")
+            lock = f"lock@{r.lock_utc}" if r.lock_utc else "no-session-bar"
+            print(f"║  {r.date}  S={r.start_price:<10.3f}  {lock}  No signal triggered".ljust(W+1) + "║")
             continue
         for i, t in enumerate(r.trades):
-            sym   = "✅" if t.outcome=="TP" else "❌" if t.outcome=="SL" else "⚠️"
-            stop  = " 🎯PROFIT_STOP" if (r.hit_profit and i==len(r.trades)-1) else \
-                    " ⛔LOSS_STOP"   if (r.hit_loss   and i==len(r.trades)-1) else ""
-            net_s = f"+${t.net_pnl:,.0f}" if t.net_pnl>=0 else f"-${abs(t.net_pnl):,.0f}"
+            sym  = "✅" if t.outcome == "TP" else "❌" if t.outcome == "SL" else "⚠️ "
+            stop = (" 🎯PROFIT" if (r.hit_profit and i == len(r.trades)-1) else
+                    " ⛔LOSS"   if (r.hit_loss   and i == len(r.trades)-1) else "")
+            net_s = f"+${t.net_pnl:,.0f}" if t.net_pnl >= 0 else f"-${abs(t.net_pnl):,.0f}"
+            grs_s = f"+${t.gross_pnl:,.0f}" if t.gross_pnl >= 0 else f"-${abs(t.gross_pnl):,.0f}"
+            lock_s = f"lock@{r.lock_utc}" if i == 0 else " " * 9
             print(
                 f"║  {r.date if i==0 else ' '*10}  "
-                f"S={r.start_price:.1f}  {t.direction:<5}  "
-                f"@{t.entry_price:.1f}→{t.exit_price:.1f}  "
-                f"{sym}{t.outcome:<11}  "
-                f"gross=${t.gross_pnl:+,.0f}  net={net_s}{stop}".ljust(W) + "  ║"
+                f"S={r.start_price:<9.3f}  {lock_s}  "
+                f"{t.direction:<5}  {t.entry_bar}→{t.exit_bar}  "
+                f"@{t.entry_price:.3f}→{t.exit_price:.3f}  "
+                f"{sym}{t.outcome:<11}  {grs_s}  net={net_s}{stop}".ljust(W+1) + "║"
             )
-        day_s = f"+${r.day_net:,.0f}" if r.day_net>=0 else f"-${abs(r.day_net):,.0f}"
-        print(f"║{'':>12}  DAY → gross=${r.day_gross:+,.0f}  spread=-${r.day_spread:,.0f}  net={day_s}".ljust(W) + "  ║")
+        day_s = f"+${r.day_net:,.0f}" if r.day_net >= 0 else f"-${abs(r.day_net):,.0f}"
+        print(f"║{'':>12}  DAY → gross={r.day_gross:+,.0f}  spread=-${r.day_spread:,.0f}  net={day_s}".ljust(W+1) + "║")
         print(f"╠{thn}╣")
 
     def kv(l, v):
-        return f"║  {l:<32}{str(v):<{W-36}}  ║"
+        return f"║  {l:<36}{str(v):<{W-40}}  ║"
 
-    print(f"╠{bar}╣")
+    print(f"╠{sep}╣")
     print(f"║{'MONTHLY SUMMARY':^{W}}║")
-    print(f"╠{bar}╣")
+    print(f"╠{sep}╣")
     print(kv("Trading days:", len(reports)))
-    print(kv("Active days (had trades):", f"{active_days}  ({len(win_days)} win / {len(loss_days)} loss)"))
+    print(kv("Active (had trades):", f"{active_days}  ({len(win_days)} win / {len(loss_days)} loss)"))
     print(kv("No-trigger days:", len(no_trig_days)))
     print(kv("Profit-stop days:", len(profit_days)))
     print(kv("Loss-limit days:", len(loss_lim_days)))
@@ -474,13 +458,13 @@ def print_report(
     print(kv("Force closed:", all_fc))
     print(f"║{thn}║")
     print(kv("Gross P&L:", f"${total_gross:+,.2f}"))
-    print(kv("Total spread cost:", f"-${total_spread:,.2f}"))
+    print(kv("Spread cost:", f"-${total_spread:,.2f}"))
     print(kv("NET P&L:", f"${total_net:+,.2f}"))
     print(kv("Avg net / active day:", f"${avg_per_day:+,.2f}"))
     print(kv("Monthly ROI:", f"{roi:.2f}%"))
-    print(f"╠{bar}╣")
+    print(f"╠{sep}╣")
     print(f"║{'INCOME PROJECTION':^{W}}║")
-    print(f"╠{bar}╣")
+    print(f"╠{sep}╣")
     proj_22  = avg_per_day * 22
     proj_yr  = proj_22 * 12
     proj_roi = (proj_yr / cfg.account_size * 100) if cfg.account_size else 0
@@ -488,7 +472,11 @@ def print_report(
     print(kv("Projected 22-day month:", f"${proj_22:+,.2f}"))
     print(kv("Projected annual:", f"${proj_yr:+,.2f}"))
     print(kv("Projected annual ROI:", f"{proj_roi:.1f}%"))
-    print(f"╚{bar}╝")
+    print(f"╚{sep}╝")
+    print()
+    print(f"[INFO] MT5 clock: UTC  →  day boundary = UTC midnight  →  date_mt5 = UTC date")
+    print(f"[INFO] Session  : {cfg.session_start_hhmm}–{cfg.session_end_hhmm} UTC  "
+          f"(start locked at first bar >= {cfg.session_start_hhmm} UTC)")
     print()
 
 
@@ -503,27 +491,31 @@ def _make_cfg(args) -> StrategyConfig:
         daily_profit_target_usd  = args.profit_target,
         session_start_hhmm       = args.session_start,
         session_end_hhmm         = args.session_end,
+        force_close_hhmm         = args.force_close,
         max_entry_overshoot_pips = args.overshoot,
+        server_utc_offset_hours  = 0,   # always 0 — MT5 UI is UTC
     )
-    # Explicit lot override from CLI
     cfg.__dict__['_lot_override'] = args.lot
-    original = type(cfg).lot_size.fget
+    _orig = type(cfg).lot_size.fget
     type(cfg).lot_size = property(
-        lambda self: self.__dict__.get('_lot_override') or original(self)
+        lambda self: self.__dict__.get('_lot_override') or _orig(self)
     )
     return cfg
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description = "XAUUSD Threshold Strategy Backtest",
+        description     = "XAUUSD Threshold Strategy Backtest",
         formatter_class = argparse.RawDescriptionHelpFormatter,
         epilog = """
+Matches real bot (UTC clock, session starts at UTC midnight):
+  python backtest.py --capital 50000 --lot 1.0
+
 Examples:
-  python backtest.py --capital 50000 --lot 2.5
-  python backtest.py --capital 10000 --lot 0.5 --months 1
-  python backtest.py --capital 100000 --lot 5.0 --months 2
-  python backtest.py --capital 20000 --lot 1.0 --symbol XAUUSD --months 3
+  python backtest.py --capital 50000  --lot 2.5  --months 1
+  python backtest.py --capital 10000  --lot 0.5  --months 1
+  python backtest.py --capital 100000 --lot 5.0  --months 2
+  python backtest.py --capital 50000  --lot 1.0  --months 1 --verbose
         """
     )
     p.add_argument("--capital",       type=float, required=True)
@@ -531,8 +523,10 @@ Examples:
     p.add_argument("--months",        type=int,   default=1)
     p.add_argument("--symbol",        type=str,   default="XAUUSD")
     p.add_argument("--profit-target", type=float, default=150.0)
-    p.add_argument("--session-start", type=str,   default="08:00")
-    p.add_argument("--session-end",   type=str,   default="20:00")
+    p.add_argument("--session-start", type=str,   default="00:00",
+                   help="Session start UTC (default: 00:00 = UTC midnight)")
+    p.add_argument("--session-end",   type=str,   default="23:00")
+    p.add_argument("--force-close",   type=str,   default="23:30")
     p.add_argument("--overshoot",     type=float, default=3.0)
     p.add_argument("--verbose",       action="store_true")
     return p.parse_args()
@@ -540,27 +534,31 @@ Examples:
 
 def main():
     args = parse_args()
-
     if not MT5_AVAILABLE:
         print("❌ pip install MetaTrader5")
         sys.exit(1)
 
     cfg = _make_cfg(args)
     print(cfg.summary())
+    print(f"[BACKTEST] Session: {args.session_start}–{args.session_end} UTC  "
+          f"(= real bot lock_hhmm_mt5=00:00 UTC)")
 
     try:
-        bars = fetch_bars(args.symbol, args.months, cfg.server_utc_offset_hours)
+        bars = fetch_bars(args.symbol, args.months)
     except Exception as e:
         print(f"❌ {e}")
         sys.exit(1)
 
-    day_map = group_by_day(bars, cfg.server_utc_offset_hours)
-    print(f"[BACKTEST] {len(day_map)} trading days\n")
+    day_map = group_by_day(bars)
+    print(f"[BACKTEST] {len(day_map)} UTC trading days\n")
 
     reports: list[DayReport] = []
     for date, day_bars in day_map.items():
         if args.verbose:
-            print(f"[BACKTEST] {date} ({len(day_bars)} bars)...")
+            first_bar = day_bars[0]
+            print(f"[BACKTEST] {date}  bars={len(day_bars)}  "
+                  f"first_bar={first_bar.utc_hhmm} UTC  "
+                  f"open={first_bar.open:.3f}")
         reports.append(run_day(date, day_bars, cfg))
 
     print_report(reports, cfg, args.months, args.symbol)

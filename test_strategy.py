@@ -299,7 +299,12 @@ class TestSession(unittest.TestCase):
 
     def setUp(self):
         from config import StrategyConfig
-        self.cfg = StrategyConfig()
+        # Explicit session times for tests — independent of config defaults
+        self.cfg = StrategyConfig(
+            session_start_hhmm="08:00",
+            session_end_hhmm="20:00",
+            force_close_hhmm="21:30",
+        )
 
     def _dt(self, hhmm):
         h, m = map(int, hhmm.split(":"))
@@ -344,8 +349,8 @@ class TestSession(unittest.TestCase):
 class TestStartReader(unittest.TestCase):
 
     def _today_mt5(self, cfg):
-        from start_reader import _mt5_server_date
-        return _mt5_server_date(cfg)
+        from start_reader import _utc_date_today
+        return _utc_date_today()
 
     def _write(self, tmpdir, payload):
         folder = os.path.join(tmpdir, "start", "XAUUSD")
@@ -359,7 +364,11 @@ class TestStartReader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = StrategyConfig(base_dir=d)
             today = self._today_mt5(cfg)
-            self._write(d, {"status":"LOCKED","price":4513.0,"date_mt5":today})
+            # Real schema: nested start block (matches 2026-04-01.json)
+            self._write(d, {
+                "date_mt5": today,
+                "start": {"status":"LOCKED","price":4513.0}
+            })
             self.assertAlmostEqual(read_start_price(cfg), 4513.0)
 
     def test_pending_returns_none(self):
@@ -367,7 +376,8 @@ class TestStartReader(unittest.TestCase):
         from start_reader import read_start_price
         with tempfile.TemporaryDirectory() as d:
             cfg = StrategyConfig(base_dir=d)
-            self._write(d, {"status":"PENDING","price":None,"date_mt5":self._today_mt5(cfg)})
+            self._write(d, {"date_mt5": self._today_mt5(cfg),
+                             "start":{"status":"PENDING","price":None}})
             self.assertIsNone(read_start_price(cfg))
 
     def test_stale_mt5_date_returns_none(self):
@@ -375,7 +385,8 @@ class TestStartReader(unittest.TestCase):
         from start_reader import read_start_price
         with tempfile.TemporaryDirectory() as d:
             cfg = StrategyConfig(base_dir=d)
-            self._write(d, {"status":"LOCKED","price":4513.0,"date_mt5":"2020-01-01"})
+            self._write(d, {"date_mt5":"2020-01-01",
+                             "start":{"status":"LOCKED","price":4513.0}})
             self.assertIsNone(read_start_price(cfg))
 
     def test_corrupt_json_returns_none(self):
@@ -400,20 +411,19 @@ class TestStartReader(unittest.TestCase):
         from start_reader import read_start_price
         with tempfile.TemporaryDirectory() as d:
             cfg = StrategyConfig(base_dir=d)
-            self._write(d, {"status":"LOCKED","price":"4513.0","date_mt5":self._today_mt5(cfg)})
+            self._write(d, {"date_mt5": self._today_mt5(cfg),
+                             "start":{"status":"LOCKED","price":"4513.0"}})
             self.assertIsInstance(read_start_price(cfg), float)
 
-    def test_server_day_uses_offset(self):
-        """MT5 server date must use server_utc_offset_hours, not naive UTC."""
-        from config import StrategyConfig
-        from start_reader import _mt5_server_date
-        cfg_utc2 = StrategyConfig(server_utc_offset_hours=2)
-        cfg_utc0 = StrategyConfig(server_utc_offset_hours=0)
-        # Dates may differ at rollover boundaries — just ensure strings format correctly
-        d2 = _mt5_server_date(cfg_utc2)
-        d0 = _mt5_server_date(cfg_utc0)
-        self.assertRegex(d2, r"\d{4}-\d{2}-\d{2}")
-        self.assertRegex(d0, r"\d{4}-\d{2}-\d{2}")
+    def test_utc_date_today(self):
+        """date_mt5 is UTC calendar date. Confirm _utc_date_today returns correct format."""
+        from start_reader import _utc_date_today
+        from datetime import datetime, timezone
+        d = _utc_date_today()
+        self.assertRegex(d, r"\d{4}-\d{2}-\d{2}")
+        # Should match current UTC date
+        expected = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.assertEqual(d, expected)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -684,7 +694,7 @@ class TestBacktest(unittest.TestCase):
         from backtest import Bar
         from datetime import datetime, timezone
         h_v, m_v = map(int, hhmm.split(":"))
-        return Bar(time=datetime(2026,3,31,h_v,m_v,tzinfo=timezone.utc), open=o, high=h, low=l, close=c)
+        return Bar(time_utc=datetime(2026,3,31,h_v,m_v,tzinfo=timezone.utc), open=o, high=h, low=l, close=c)
 
     def _day(self, bars_args):
         return [self._bar(*a) for a in bars_args]
@@ -797,14 +807,18 @@ class TestBacktest(unittest.TestCase):
     def test_group_by_day(self):
         from backtest import Bar, group_by_day
         from datetime import datetime, timezone
+        def make(y,mo,d,h,m):
+            return Bar(time_utc=datetime(y,mo,d,h,m,tzinfo=timezone.utc),open=4510,high=4512,low=4508,close=4510)
         bars = [
-            Bar(datetime(2026,3,31,6,0,tzinfo=timezone.utc),4510,4512,4508,4510),
-            Bar(datetime(2026,3,31,22,0,tzinfo=timezone.utc),4520,4522,4518,4520),
-            Bar(datetime(2026,4,1,6,0,tzinfo=timezone.utc),4530,4532,4528,4530),
+            make(2026,3,31,6,0),    # UTC 06:00 → date 2026-03-31
+            make(2026,3,31,22,0),   # UTC 22:00 → date 2026-03-31
+            make(2026,4,1,6,0),     # UTC 06:00 → date 2026-04-01
         ]
-        dm = group_by_day(bars, server_utc_offset=2)
+        dm = group_by_day(bars)
         self.assertIn("2026-03-31", dm)
         self.assertIn("2026-04-01", dm)
+        # Verify UTC grouping: 22:00 March 31 is still March 31 in UTC
+        self.assertEqual(len(dm["2026-03-31"]), 2)
 
     def test_overshoot_rejects_stale_entry(self):
         """Bar close is 6 pips past entry → overshoot filter rejects it."""
