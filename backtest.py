@@ -182,22 +182,81 @@ def _check_exit_on_bar(
 def _check_entry_on_bar(
     direction: Direction, entry: float, bar: Bar, overshoot: float,
 ) -> bool:
+    """
+    TICK-TOUCH entry (original, Mode A):
+    Bar high/low just needs to cross entry level.
+    Fires on the crossing bar itself — vulnerable to same-bar SL.
+    """
     if direction == "LONG":
         return bar.high >= entry and (bar.close - entry) <= overshoot
     else:
         return bar.low <= entry and (entry - bar.close) <= overshoot
 
 
+def _check_entry_close_confirm(
+    direction: Direction, entry: float, bar: Bar,
+) -> bool:
+    """
+    CLOSE-CONFIRMATION entry (Mode B — --close-confirm):
+    Bar must CLOSE at or beyond the entry level.
+    Order executes at NEXT bar open, eliminating same-bar SL hits.
+    This is a real breakout confirmation, not a tick touch.
+
+    LONG:  bar.close >= entry  (closed above trigger = real breakout)
+    SHORT: bar.close <= entry  (closed below trigger = real breakdown)
+    """
+    if direction == "LONG":
+        return bar.close >= entry
+    else:
+        return bar.close <= entry
+
+
+def _trend_filter_ok(direction: Direction, bar: Bar, start_price: float) -> bool:
+    """
+    TREND FILTER (--trend-filter):
+    Only take LONG trades if price is above start price (uptrend bias).
+    Only take SHORT trades if price is below start price (downtrend bias).
+    Uses bar open as proxy for current price direction.
+    """
+    if direction == "LONG":
+        return bar.open >= start_price
+    else:
+        return bar.open <= start_price
+
+
 # =============================================================================
 # DAY SIMULATION
 # =============================================================================
 
-def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
+def run_day(
+    date:         str,
+    bars:         list[Bar],
+    cfg:          StrategyConfig,
+    close_confirm: bool = False,   # True = close-confirmation entry (next-bar open)
+    trend_filter:  bool = False,   # True = only trade in direction of start→current
+) -> DayReport:
+    """
+    Replay one UTC calendar day bar by bar.
+
+    close_confirm=True (recommended):
+        Entry fires when bar CLOSES past the entry level.
+        Order is placed at next bar open.
+        Eliminates same-bar SL hits caused by 2-pip SL being smaller than M5 bar range.
+
+    trend_filter=True (optional additive):
+        Only take LONG if bar.open > start_price (price is above day start).
+        Only take SHORT if bar.open < start_price.
+        Reduces false breakouts against the prevailing intraday direction.
+    """
     report          = DayReport(date=date, start_price=0.0)
     already_traded: set[Direction] = set()
     trade_count     = 0
     realized_pnl    = 0.0
     open_trade: TradeRecord | None = None
+
+    # Pending close-confirm signal: (direction, entry, tp, sl, signal_bar_hhmm)
+    # Executed at next bar's open
+    pending_entry: tuple | None = None
 
     # Lock start price at first bar >= session_start (UTC)
     start_bar = next((b for b in bars if b.utc_hhmm >= cfg.session_start_hhmm), None)
@@ -210,12 +269,16 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
     report.lock_utc    = start_bar.utc_hhmm
     levels             = compute_levels(start_price, cfg)
 
-    for bar in bars:
+    bars_list = list(bars)
+
+    for i, bar in enumerate(bars_list):
         if bar.utc_hhmm < cfg.session_start_hhmm:
             continue
 
         # Force close
         if bar.utc_hhmm >= cfg.force_close_hhmm:
+            # Cancel pending close-confirm entry at force-close time
+            pending_entry = None
             if open_trade is not None:
                 ep    = bar.open
                 gross = _pnl(open_trade.direction, open_trade.entry_price, ep, cfg.lot_size)
@@ -230,7 +293,31 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
                 open_trade = None
             break
 
-        # Step 1: resolve open position
+        # ── CLOSE-CONFIRM: execute pending entry at this bar's open ─────────
+        if close_confirm and pending_entry is not None:
+            p_dir, p_entry, p_tp, p_sl, p_signal_bar = pending_entry
+            pending_entry = None
+
+            # Execute at this bar's open price
+            exec_price = bar.open
+
+            snap = RiskSnapshot(realized_pnl=realized_pnl, open_pnl=0.0,
+                                trade_count=trade_count, open_position_count=0)
+            allowed, _ = can_place_trade(snap, cfg)
+
+            if allowed:
+                trade = TradeRecord(
+                    day=date, direction=p_dir,
+                    entry_price=exec_price, tp_price=p_tp, sl_price=p_sl,
+                    entry_bar=f"{p_signal_bar}→{bar.utc_hhmm}",
+                )
+                report.trades.append(trade)
+                already_traded.add(p_dir)
+                trade_count += 1
+                open_trade = trade
+                # No same-bar check here — entry is at bar open, SL check runs next iteration
+
+        # Step 1: resolve open position on this bar
         if open_trade is not None:
             result = _check_exit_on_bar(
                 open_trade.direction, open_trade.entry_price,
@@ -257,7 +344,7 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
             report.hit_loss = True; break
         if trade_count >= cfg.max_trades_per_day:
             break
-        if open_trade is not None:
+        if open_trade is not None or pending_entry is not None:
             continue
 
         # Step 3: entry signal
@@ -274,41 +361,54 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
             tp    = levels.long_tp     if direction == "LONG"  else levels.short_tp
             sl    = levels.long_sl     if direction == "LONG"  else levels.short_sl
 
-            if not _check_entry_on_bar(direction, entry, bar, cfg.max_entry_overshoot_pips):
+            # Trend filter gate
+            if trend_filter and not _trend_filter_ok(direction, bar, start_price):
                 continue
 
-            snap = RiskSnapshot(realized_pnl=realized_pnl, open_pnl=0.0,
-                                trade_count=trade_count, open_position_count=0)
-            allowed, _ = can_place_trade(snap, cfg)
-            if not allowed:
-                continue
-
-            trade = TradeRecord(day=date, direction=direction,
-                                entry_price=entry, tp_price=tp, sl_price=sl,
-                                entry_bar=bar.utc_hhmm)
-            report.trades.append(trade)
-            already_traded.add(direction)
-            trade_count += 1
-
-            # Step 4: same-bar exit
-            result = _check_exit_on_bar(direction, entry, tp, sl, bar, entry_on_bar=True)
-            if result is not None:
-                outcome, exit_price = result
-                gross = _pnl(direction, entry, exit_price, cfg.lot_size)
-                sp    = _spread_cost(cfg.lot_size)
-                realized_pnl    += gross
-                trade.exit_price = exit_price
-                trade.exit_bar   = bar.utc_hhmm
-                trade.outcome    = outcome
-                trade.gross_pnl  = gross
-                trade.spread_cost= sp
-                trade.net_pnl    = round(gross - sp, 2)
-                open_trade       = None
+            if close_confirm:
+                # Close-confirmation: bar must CLOSE past entry level
+                if not _check_entry_close_confirm(direction, entry, bar):
+                    continue
+                # Queue for next-bar execution
+                pending_entry = (direction, entry, tp, sl, bar.utc_hhmm)
+                break   # one pending at a time
             else:
-                open_trade = trade
+                # Tick-touch: bar high/low crosses entry (original logic)
+                if not _check_entry_on_bar(direction, entry, bar, cfg.max_entry_overshoot_pips):
+                    continue
 
-            if mode == "first_only":
-                break
+                snap = RiskSnapshot(realized_pnl=realized_pnl, open_pnl=0.0,
+                                    trade_count=trade_count, open_position_count=0)
+                allowed, _ = can_place_trade(snap, cfg)
+                if not allowed:
+                    continue
+
+                trade = TradeRecord(day=date, direction=direction,
+                                    entry_price=entry, tp_price=tp, sl_price=sl,
+                                    entry_bar=bar.utc_hhmm)
+                report.trades.append(trade)
+                already_traded.add(direction)
+                trade_count += 1
+
+                # Step 4: same-bar exit (tick-touch mode only)
+                result = _check_exit_on_bar(direction, entry, tp, sl, bar, entry_on_bar=True)
+                if result is not None:
+                    outcome, exit_price = result
+                    gross = _pnl(direction, entry, exit_price, cfg.lot_size)
+                    sp    = _spread_cost(cfg.lot_size)
+                    realized_pnl    += gross
+                    trade.exit_price = exit_price
+                    trade.exit_bar   = bar.utc_hhmm
+                    trade.outcome    = outcome
+                    trade.gross_pnl  = gross
+                    trade.spread_cost= sp
+                    trade.net_pnl    = round(gross - sp, 2)
+                    open_trade       = None
+                else:
+                    open_trade = trade
+
+                if mode == "first_only":
+                    break
 
     # EOD close
     if open_trade is not None and bars:
@@ -337,7 +437,8 @@ def run_day(date: str, bars: list[Bar], cfg: StrategyConfig) -> DayReport:
 
 W = 84
 
-def print_report(reports: list[DayReport], cfg: StrategyConfig, months: int, symbol: str):
+def print_report(reports: list[DayReport], cfg: StrategyConfig, months: int, symbol: str,
+                 close_confirm: bool = False, trend_filter: bool = False):
     total_gross  = sum(r.day_gross  for r in reports)
     total_spread = sum(r.day_spread for r in reports)
     total_net    = sum(r.day_net    for r in reports)
@@ -368,8 +469,9 @@ def print_report(reports: list[DayReport], cfg: StrategyConfig, months: int, sym
            f"SL=${cfg.sl_dollar:.0f}/trade  TP=${cfg.tp_dollar:.0f}/trade  "
            f"R:R=1:{cfg.risk_reward:.1f}  "
            f"DailyLoss=-${cfg.max_daily_loss_usd:.0f}  DailyProfit=+${cfg.daily_profit_target_usd:.0f}").ljust(W+1) + "║")
-    print(f"║  Entry S±{cfg.entry_offset}  TP S±{cfg.exit_offset}  SL S±{cfg.breakout_offset}  "
-          f"Breakeven WR: {cfg.breakeven_win_rate*100:.1f}%  Session: {cfg.session_start_hhmm}–{cfg.session_end_hhmm} UTC".ljust(W+1) + "║")
+    entry_mode = ("CLOSE-CONFIRM+NEXT-BAR" if close_confirm else "TICK-TOUCH⚠️ ")
+    if trend_filter: entry_mode += "+TREND-FILTER"
+    print(f"║  Entry mode: {entry_mode}".ljust(W+1) + "║")
     print(f"╠{sep}╣")
     print(f"║{'DAY-BY-DAY  (UTC — matches date_mt5 and lock_hhmm_mt5=00:00)':^{W}}║")
     print(f"╠{thn}╣")
@@ -478,16 +580,28 @@ def parse_args():
         description     = "XAUUSD Threshold Strategy Backtest",
         formatter_class = argparse.RawDescriptionHelpFormatter,
         epilog = """
-Lot size is derived automatically from --sl-target.
-  SL=$100 at 2 pip SL = 0.5 lot (0.5 × 2 pips × $100/pip = $100)
-  TP=$150 = 3 pips at 0.5 lot   (R:R = 1.5:1, breakeven = 40%)
-  TP=$200 = 4 pips at 0.5 lot   (R:R = 2.0:1, breakeven = 33%)
+THE PROBLEM WITH DEFAULT (tick-touch) MODE:
+  2-pip SL < typical M5 bar range on gold (5-20 pips).
+  Entry fires on bar touch, same bar immediately hits SL.
+  Result: 0% win rate regardless of lot/target size.
+
+SOLUTION — use --close-confirm (strongly recommended):
+  Bar must CLOSE past entry level → order at NEXT bar open.
+  Same-bar SL eliminated. Win rate reflects real breakouts.
 
 Examples:
-  python backtest.py --capital 50000 --sl-target 100 --tp-target 150
+  # Baseline (broken — same-bar SL)
   python backtest.py --capital 50000 --sl-target 100 --tp-target 200
-  python backtest.py --capital 50000 --sl-target 100 --tp-target 150 --months 2
-  python backtest.py --capital 50000 --sl-target 200 --tp-target 300 --daily-loss 200
+
+  # Fixed: close confirmation only
+  python backtest.py --capital 50000 --sl-target 100 --tp-target 200 --close-confirm
+
+  # Fixed + trend filter (strongest signal quality)
+  python backtest.py --capital 50000 --sl-target 100 --tp-target 200 --close-confirm --trend-filter
+
+  # Compare all 3 modes:
+  python backtest.py --capital 50000 --sl-target 100 --tp-target 150 --close-confirm
+  python backtest.py --capital 50000 --sl-target 100 --tp-target 150 --close-confirm --trend-filter
         """
     )
     p.add_argument("--capital",       type=float, required=True,
@@ -505,6 +619,12 @@ Examples:
     p.add_argument("--session-start", type=str,   default="00:00")
     p.add_argument("--session-end",   type=str,   default="23:00")
     p.add_argument("--force-close",   type=str,   default="23:30")
+    p.add_argument("--close-confirm", action="store_true",
+                   help="Entry only on bar CLOSE past level. Execute at next bar open. "
+                        "Eliminates same-bar SL hits. RECOMMENDED.")
+    p.add_argument("--trend-filter",  action="store_true",
+                   help="Only LONG if price above start, only SHORT if below start. "
+                        "Filters entries against intraday trend.")
     p.add_argument("--overshoot",     type=float, default=3.0)
     p.add_argument("--verbose",       action="store_true")
     return p.parse_args()
@@ -534,9 +654,15 @@ def main():
             fb = day_bars[0]
             print(f"[BACKTEST] {date}  bars={len(day_bars)}  "
                   f"first={fb.utc_hhmm}UTC  open={fb.open:.3f}")
-        reports.append(run_day(date, day_bars, cfg))
+        reports.append(run_day(
+            date, day_bars, cfg,
+            close_confirm = args.close_confirm,
+            trend_filter  = args.trend_filter,
+        ))
 
-    print_report(reports, cfg, args.months, args.symbol)
+    print_report(reports, cfg, args.months, args.symbol,
+                 close_confirm=args.close_confirm,
+                 trend_filter=args.trend_filter)
 
 
 if __name__ == "__main__":
