@@ -353,9 +353,10 @@ class TestStartReader(unittest.TestCase):
         return _utc_date_today()
 
     def _write(self, tmpdir, payload):
-        folder = os.path.join(tmpdir, "start", "XAUUSD")
+        # Matches storage.resolve_start_root_path: data/start_price/XAUUSD.json
+        folder = os.path.join(tmpdir, "start_price")
         os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, "start.json"), "w") as f:
+        with open(os.path.join(folder, "XAUUSD.json"), "w") as f:
             json.dump(payload, f)
 
     def test_reads_locked_with_mt5_date(self):
@@ -394,9 +395,9 @@ class TestStartReader(unittest.TestCase):
         from start_reader import read_start_price
         with tempfile.TemporaryDirectory() as d:
             cfg = StrategyConfig(base_dir=d)
-            folder = os.path.join(d, "start", "XAUUSD")
+            folder = os.path.join(d, "start_price")
             os.makedirs(folder, exist_ok=True)
-            with open(os.path.join(folder, "start.json"), "w") as f:
+            with open(os.path.join(folder, "XAUUSD.json"), "w") as f:
                 f.write("{BAD}")
             self.assertIsNone(read_start_price(cfg))
 

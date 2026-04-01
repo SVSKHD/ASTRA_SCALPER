@@ -2,22 +2,18 @@ from __future__ import annotations
 
 # =============================================================================
 # STRATEGY RUNNER — MAIN LOOP
-# Flow: start_reader → threshold → trade_signal → risk_control → executor
-#
-# Fixes applied:
-#   - Import from trade_signal (not signal — stdlib collision)
-#   - Daily profit stop added
-#   - MT5 server-day used for rollover detection
+# Reads start price from: data/start_price/<symbol>.json
+# (matches storage.resolve_start_root_path in the repo)
 # =============================================================================
 
 import time
 import MetaTrader5 as mt5
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from config import cfg
-from start_reader import read_start_price, _mt5_server_date
+from start_reader import read_start_price, _utc_date_today
 from threshold import compute_levels, ThresholdLevels
-from trade_signal import evaluate_signal, Signal, Direction  # FIX: trade_signal not signal
+from trade_signal import evaluate_signal, Signal, Direction
 from session_guard import is_session_allowed, is_force_close_time, session_status
 from risk_control import (
     RiskSnapshot, can_place_trade,
@@ -32,11 +28,11 @@ from executor import (
 
 class DayState:
     def __init__(self):
-        self.date:           str                  = ""
-        self.start_price:    float | None         = None
-        self.levels:         ThresholdLevels | None = None
-        self.already_traded: set[Direction]       = set()
-        self.trade_count:    int                  = 0
+        self.date:            str                   = ""
+        self.start_price:     float | None          = None
+        self.levels:          ThresholdLevels | None = None
+        self.already_traded:  set[Direction]        = set()
+        self.trade_count:     int                   = 0
 
     def reset(self, date: str):
         self.date           = date
@@ -47,9 +43,9 @@ class DayState:
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
 
-def _today(strategy_cfg=cfg) -> str:
-    """MT5 server date — matches date_mt5 field in start price JSON."""
-    return _mt5_server_date(strategy_cfg)
+def _today() -> str:
+    """UTC calendar date — matches date_mt5 written by start_price.py."""
+    return _utc_date_today()
 
 
 def _mid(symbol: str) -> float | None:
@@ -76,7 +72,7 @@ def _force_close(state: DayState):
     pnl = calculate_day_pnl(cfg)
     print(
         f"\n[{cfg.symbol}] ── END OF DAY ─────────────────────\n"
-        f"  MT5 Date   : {state.date}\n"
+        f"  UTC Date   : {state.date}\n"
         f"  Trades     : {state.trade_count}\n"
         f"  Realized   : ${pnl:+.2f}\n"
         f"───────────────────────────────────────\n"
@@ -109,7 +105,7 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             f"  SL         : {signal.sl_price:.2f}\n"
             f"  Day PnL    : ${post:+.2f}\n"
             f"  Budget left: ${budget:.0f}\n"
-            f"  Profit tgt : ${cfg.daily_profit_target_usd:.0f}"
+            f"  Profit tgt : +${cfg.daily_profit_target_usd:.0f}"
         )
         return True
 
@@ -122,24 +118,25 @@ def run():
     if not mt5.initialize():
         raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
-    state           = DayState()
+    state        = DayState()
     state.reset(_today())
-    force_closed    = False
-    last_log_ts     = 0.0
-    last_warn_ts    = 0.0
+    force_closed = False
+    last_log_ts  = 0.0
+    last_warn_ts = 0.0
 
-    print(f"[{cfg.symbol}] ⏳ Waiting for start price lock...")
+    print(f"[{cfg.symbol}] ⏳ Waiting for start price...")
+    print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
 
     while True:
         try:
             today = _today()
 
-            # ── DATE ROLLOVER (MT5 server-day) ──────────────────────────────
+            # ── DATE ROLLOVER (UTC midnight) ─────────────────────────────────
             if today != state.date:
                 state.reset(today)
                 force_closed = False
 
-            # ── START PRICE ─────────────────────────────────────────────────
+            # ── START PRICE ──────────────────────────────────────────────────
             if state.start_price is None:
                 price = read_start_price(cfg)
                 if price is None:
@@ -149,7 +146,7 @@ def run():
                 state.levels      = compute_levels(price, cfg)
                 print(state.levels.display())
 
-            # ── FORCE CLOSE (EOD) ───────────────────────────────────────────
+            # ── FORCE CLOSE ──────────────────────────────────────────────────
             if is_force_close_time(cfg) and not force_closed:
                 _force_close(state)
                 force_closed = True
@@ -160,69 +157,63 @@ def run():
                 time.sleep(10.0)
                 continue
 
-            # ── SESSION GATE ────────────────────────────────────────────────
+            # ── SESSION GATE ─────────────────────────────────────────────────
             if not is_session_allowed(cfg):
                 time.sleep(5.0)
                 continue
 
-            # ── LIVE P&L ────────────────────────────────────────────────────
             realized = calculate_day_pnl(cfg)
 
-            # ── DAILY PROFIT STOP ───────────────────────────────────────────
+            # ── DAILY PROFIT STOP ────────────────────────────────────────────
             if is_daily_profit_hit(realized, cfg):
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
                     print(
                         f"[{cfg.symbol}] 🎯 PROFIT TARGET HIT | "
-                        f"PnL=${realized:+.2f} | "
-                        f"target=+${cfg.daily_profit_target_usd:.0f} | "
-                        f"No more trades today."
+                        f"PnL=${realized:+.2f} | target=+${cfg.daily_profit_target_usd:.0f}"
                     )
                     last_warn_ts = now
                 time.sleep(10.0)
                 continue
 
-            # ── DAILY LOSS GATE ─────────────────────────────────────────────
+            # ── DAILY LOSS GATE ──────────────────────────────────────────────
             if is_daily_limit_breached(realized, cfg):
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
                     print(
                         f"[{cfg.symbol}] ⛔ LOSS LIMIT BREACHED | "
-                        f"PnL=${realized:+.2f} | "
-                        f"limit=-${cfg.max_daily_loss_usd:.0f}"
+                        f"PnL=${realized:+.2f} | limit=-${cfg.max_daily_loss_usd:.0f}"
                     )
                     last_warn_ts = now
                 time.sleep(10.0)
                 continue
 
-            # ── MAX TRADES ──────────────────────────────────────────────────
+            # ── MAX TRADES ───────────────────────────────────────────────────
             if state.trade_count >= cfg.max_trades_per_day:
                 time.sleep(5.0)
                 continue
 
-            # ── PRICE ───────────────────────────────────────────────────────
+            # ── PRICE ────────────────────────────────────────────────────────
             mid = _mid(cfg.symbol)
             if mid is None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ── STATUS LOG (every 30s) ──────────────────────────────────────
+            # ── STATUS LOG (every 30s) ───────────────────────────────────────
             now = time.time()
             if now - last_log_ts >= 30.0:
                 budget = cfg.max_daily_loss_usd - abs(min(realized, 0))
                 print(
                     f"[{cfg.symbol}] {session_status(cfg)} | "
                     f"Mid={mid:.2f} | "
-                    f"LongEntry={state.levels.long_entry:.2f} | "
-                    f"ShortEntry={state.levels.short_entry:.2f} | "
+                    f"LEntry={state.levels.long_entry:.2f} | "
+                    f"SEntry={state.levels.short_entry:.2f} | "
                     f"Trades={state.trade_count}/{cfg.max_trades_per_day} | "
-                    f"PnL=${realized:+.2f} | "
-                    f"Budget=${budget:.0f} | "
-                    f"ProfitTgt=${cfg.daily_profit_target_usd:.0f}"
+                    f"PnL=${realized:+.2f} | Budget=${budget:.0f}"
                 )
                 last_log_ts = now
 
-            # ── SIGNAL → RISK GATE → ORDER ──────────────────────────────────
+            # ── SIGNAL → RISK GATE → ORDER ───────────────────────────────────
             sig = evaluate_signal(mid, state.levels, state.already_traded, cfg)
             if sig:
                 _handle_signal(sig, state)
