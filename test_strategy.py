@@ -38,60 +38,60 @@ class TestConfig(unittest.TestCase):
         from config import StrategyConfig
         return StrategyConfig(**kw)
 
-    def test_entry_offset_is_22(self):
-        self.assertAlmostEqual(self._c().entry_offset, 22.0)
+    def test_entry_offset_is_25(self):
+        """5-pip SL: entry_multiplier=1.25 → 20×1.25=25"""
+        self.assertAlmostEqual(self._c().entry_offset, 25.0)
 
-    def test_exit_offset_is_25(self):
-        """exit_multiplier=1.25 → 20 × 1.25 = 25"""
-        self.assertAlmostEqual(self._c().exit_offset, 25.0)
+    def test_exit_offset_is_35(self):
+        """5-pip SL: exit_multiplier=1.75 → 20×1.75=35"""
+        self.assertAlmostEqual(self._c().exit_offset, 35.0)
 
     def test_breakout_offset_is_20(self):
         self.assertAlmostEqual(self._c().breakout_offset, 20.0)
 
-    def test_sl_pips_is_2(self):
-        """SL = entry_offset − breakout_offset = 22 − 20 = 2"""
-        self.assertAlmostEqual(self._c().sl_pips, 2.0)
+    def test_sl_pips_is_5(self):
+        """5-pip default: entry_offset(25) − breakout_offset(20) = 5"""
+        self.assertAlmostEqual(self._c().sl_pips, 5.0)
 
-    def test_tp_pips_is_3(self):
-        """TP = exit_offset − entry_offset = 25 − 22 = 3 at exit_multiplier=1.25"""
-        self.assertAlmostEqual(self._c().tp_pips, 3.0)
+    def test_tp_pips_is_10(self):
+        """5-pip default: exit(35) − entry(25) = 10 pips"""
+        self.assertAlmostEqual(self._c().tp_pips, 10.0)
 
-    def test_rr_is_1_5(self):
-        """R:R = tp_pips(3) / sl_pips(2) = 1.5 at exit_multiplier=1.25"""
-        self.assertAlmostEqual(self._c().risk_reward, 1.5)
+    def test_rr_is_2(self):
+        """5-pip default: tp_pips(10) / sl_pips(5) = 2.0"""
+        self.assertAlmostEqual(self._c().risk_reward, 2.0)
 
-    def test_breakeven_win_rate_40pct(self):
-        """Breakeven = sl/(sl+tp) = 2/5 = 0.40 at 1.5 R:R"""
-        self.assertAlmostEqual(self._c().breakeven_win_rate, 0.40)
+    def test_breakeven_win_rate_33pct(self):
+        """5-pip default: sl/(sl+tp) = 5/15 = 0.333"""
+        self.assertAlmostEqual(self._c().breakeven_win_rate, round(5/15, 4))
 
     def test_lot_size_from_sl_target(self):
-        # lot = sl_dollar_target / (sl_pips * 100)
-        # $100 SL, 2 pip SL → 0.5 lot regardless of account size
-        self.assertAlmostEqual(self._c(account_size=10_000).lot_size, 0.5)
-        self.assertAlmostEqual(self._c(account_size=50_000).lot_size, 0.5)
-        self.assertAlmostEqual(self._c(account_size=100_000).lot_size, 0.5)
+        # 5-pip default: lot = 100 / (5 × 100) = 0.2
+        self.assertAlmostEqual(self._c(account_size=10_000).lot_size, 0.2)
+        self.assertAlmostEqual(self._c(account_size=50_000).lot_size, 0.2)
+        self.assertAlmostEqual(self._c(account_size=100_000).lot_size, 0.2)
 
     def test_lot_size_changes_with_sl_target(self):
-        # $200 SL → 1.0 lot
+        # $200 SL at 5 pips → 200/(5×100) = 0.4 lot
         c = self._c(sl_dollar_target=200)
-        self.assertAlmostEqual(c.lot_size, 1.0)
+        self.assertAlmostEqual(c.lot_size, 0.4)
 
     def test_daily_loss_limit_default(self):
         # Default daily loss = sl_dollar_target = $100
         self.assertAlmostEqual(self._c(account_size=50_000).max_daily_loss_usd, 100.0)
 
     def test_daily_profit_target_default(self):
-        self.assertEqual(self._c().daily_profit_target_usd, 150.0)
+        self.assertEqual(self._c().daily_profit_target_usd, 200.0)
 
     def test_sl_dollar_matches_target(self):
         # sl_dollar should equal sl_dollar_target
         c = self._c(account_size=50_000)
         self.assertAlmostEqual(c.sl_dollar, c.sl_dollar_target)
 
-    def test_tp_dollar_150(self):
-        # default: exit_multiplier=1.25, tp=3 pips, 0.5 lot → $150
+    def test_tp_dollar_200(self):
+        # 5-pip default: tp=10 pips, 0.2 lot → 10×0.2×100 = $200
         c = self._c(account_size=50_000)
-        self.assertAlmostEqual(c.tp_dollar, 150.0)
+        self.assertAlmostEqual(c.tp_dollar, 200.0)
 
     def test_summary_contains_account(self):
         self.assertIn("50,000", self._c(account_size=50_000).summary())
@@ -115,12 +115,12 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(self._lv(4513).long_breakout, 4533.0)
 
     def test_long_entry(self):
-        """Start 4513: entry = 4513+22 = 4535"""
-        self.assertAlmostEqual(self._lv(4513).long_entry, 4535.0)
+        """5-pip: start 4513, entry = 4513+25 = 4538"""
+        self.assertAlmostEqual(self._lv(4513).long_entry, 4538.0)
 
     def test_long_tp(self):
-        """Start 4513: TP = 4513+25 = 4538 at exit_multiplier=1.25"""
-        self.assertAlmostEqual(self._lv(4513).long_tp, 4538.0)
+        """5-pip: start 4513, TP = 4513+35 = 4548"""
+        self.assertAlmostEqual(self._lv(4513).long_tp, 4548.0)
 
     def test_long_sl(self):
         """SL = breakout level = 4533"""
@@ -134,11 +134,12 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(self._lv(4513).short_breakout, 4493.0)
 
     def test_short_entry(self):
-        self.assertAlmostEqual(self._lv(4513).short_entry, 4491.0)
+        """5-pip: start 4513, short_entry = 4513-25 = 4488"""
+        self.assertAlmostEqual(self._lv(4513).short_entry, 4488.0)
 
     def test_short_tp(self):
-        """Start 4513: short TP = 4513-25 = 4488 at exit_multiplier=1.25"""
-        self.assertAlmostEqual(self._lv(4513).short_tp, 4488.0)
+        """5-pip: start 4513, short TP = 4513-35 = 4478"""
+        self.assertAlmostEqual(self._lv(4513).short_tp, 4478.0)
 
     def test_short_sl(self):
         self.assertAlmostEqual(self._lv(4513).short_sl, 4493.0)
@@ -148,10 +149,10 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(lv.short_sl, lv.short_breakout)
 
     def test_capture_per_trade(self):
-        """Capture = exit - entry = 25 - 22 = $3 per pip at exit_multiplier=1.25"""
+        """5-pip: capture = exit(35) - entry(25) = 10 pips"""
         lv = self._lv(4513)
-        self.assertAlmostEqual(lv.long_tp - lv.long_entry, 3.0)
-        self.assertAlmostEqual(lv.short_entry - lv.short_tp, 3.0)
+        self.assertAlmostEqual(lv.long_tp - lv.long_entry, 10.0)
+        self.assertAlmostEqual(lv.short_entry - lv.short_tp, 10.0)
 
     def test_symmetry(self):
         lv = self._lv(4500)
@@ -159,29 +160,29 @@ class TestThreshold(unittest.TestCase):
 
     def test_26_mar_levels(self):
         lv = self._lv(4517)
-        self.assertAlmostEqual(lv.long_entry,  4539.0)
-        self.assertAlmostEqual(lv.short_entry, 4495.0)
-        self.assertAlmostEqual(lv.long_tp,     4542.0)  # 4517+25
-        self.assertAlmostEqual(lv.short_tp,    4492.0)  # 4517-25
+        self.assertAlmostEqual(lv.long_entry,  4542.0)  # 4517+25
+        self.assertAlmostEqual(lv.short_entry, 4492.0)  # 4517-25
+        self.assertAlmostEqual(lv.long_tp,     4552.0)  # 4517+35
+        self.assertAlmostEqual(lv.short_tp,    4482.0)  # 4517-35
 
     def test_27_mar_levels(self):
         lv = self._lv(4384)
-        self.assertAlmostEqual(lv.long_entry,  4406.0)
-        self.assertAlmostEqual(lv.short_entry, 4362.0)
-        self.assertAlmostEqual(lv.long_tp,     4409.0)  # 4384+25
+        self.assertAlmostEqual(lv.long_entry,  4409.0)  # 4384+25
+        self.assertAlmostEqual(lv.short_entry, 4359.0)  # 4384-25
+        self.assertAlmostEqual(lv.long_tp,     4419.0)  # 4384+35
 
     def test_31_mar_levels(self):
         lv = self._lv(4513)
-        self.assertAlmostEqual(lv.long_entry,  4535.0)
-        self.assertAlmostEqual(lv.short_entry, 4491.0)
-        self.assertAlmostEqual(lv.long_tp,     4538.0)  # 4513+25
-        self.assertAlmostEqual(lv.short_tp,    4488.0)  # 4513-25
+        self.assertAlmostEqual(lv.long_entry,  4538.0)  # 4513+25
+        self.assertAlmostEqual(lv.short_entry, 4488.0)  # 4513-25
+        self.assertAlmostEqual(lv.long_tp,     4548.0)  # 4513+35
+        self.assertAlmostEqual(lv.short_tp,    4478.0)  # 4513-35
 
     def test_display_runs(self):
         lv = self._lv(4513)
         s = lv.display()
-        self.assertIn("4535", s)
         self.assertIn("4538", s)
+        self.assertIn("4548", s)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -207,52 +208,54 @@ class TestTradeSignal(unittest.TestCase):
         self.assertIsNone(self._ev(4500.0))
 
     def test_long_exact_entry(self):
-        sig = self._ev(4535.0)
+        # 5-pip default: entry = S+25 = 4538
+        sig = self._ev(4538.0)
         self.assertIsNotNone(sig)
         self.assertEqual(sig.direction, "LONG")
 
     def test_long_tp_is_exit_multiplier(self):
-        """TP at exit_multiplier(1.25)× = S + 25 = 4538"""
-        sig = self._ev(4535.0)
-        self.assertAlmostEqual(sig.tp_price, 4538.0)
+        """TP at exit_multiplier(1.75)× = S + 35 = 4548"""
+        sig = self._ev(4538.0)
+        self.assertAlmostEqual(sig.tp_price, 4548.0)
 
     def test_long_sl_at_breakout(self):
-        """SL must be at 1.0× = S + 20 = 4533"""
-        sig = self._ev(4535.0)
+        """SL at 1.0× = S + 20 = 4533"""
+        sig = self._ev(4538.0)
         self.assertAlmostEqual(sig.sl_price, 4533.0)
 
     def test_short_exact_entry(self):
-        sig = self._ev(4491.0)
+        # 5-pip default: short entry = S-25 = 4488
+        sig = self._ev(4488.0)
         self.assertEqual(sig.direction, "SHORT")
 
     def test_short_tp_is_exit_multiplier(self):
-        """Short TP = S - 25 = 4488"""
-        sig = self._ev(4491.0)
-        self.assertAlmostEqual(sig.tp_price, 4488.0)
+        """Short TP = S - 35 = 4478"""
+        sig = self._ev(4488.0)
+        self.assertAlmostEqual(sig.tp_price, 4478.0)
 
     def test_short_sl_at_breakout(self):
-        """Short SL = S - 20 = 4493"""
-        sig = self._ev(4491.0)
+        """Short SL = S - 20 = 4493 (short entry = 4488)"""
+        sig = self._ev(4488.0)
         self.assertAlmostEqual(sig.sl_price, 4493.0)
 
     def test_overshoot_long_allowed(self):
-        """2.5 pip overshoot < 3.0 → allowed"""
-        sig = self._ev(4537.5)
+        """2.5 pip overshoot < 3.0 → allowed (entry=4538)"""
+        sig = self._ev(4540.5)
         self.assertIsNotNone(sig)
 
     def test_overshoot_long_rejected(self):
-        """4.0 pip overshoot > 3.0 → rejected"""
-        sig = self._ev(4539.0)
+        """4.0 pip overshoot > 3.0 → rejected (entry=4538)"""
+        sig = self._ev(4542.0)
         self.assertIsNone(sig)
 
     def test_overshoot_short_allowed(self):
-        """2.5 pip below short_entry → allowed"""
-        sig = self._ev(4488.5)
+        """2.5 pip below short_entry → allowed (entry=4488)"""
+        sig = self._ev(4485.5)
         self.assertIsNotNone(sig)
 
     def test_overshoot_short_rejected(self):
-        """4.5 pip below short_entry → rejected"""
-        sig = self._ev(4486.5)
+        """4.5 pip below short_entry → rejected (entry=4488)"""
+        sig = self._ev(4483.5)
         self.assertIsNone(sig)
 
     def test_first_only_blocks_after_long(self):
@@ -269,27 +272,28 @@ class TestTradeSignal(unittest.TestCase):
         from trade_signal import evaluate_signal
         cfg = StrategyConfig(direction_mode="both")
         lv  = compute_levels(4513.0, cfg)
-        sig = evaluate_signal(4491.0, lv, {"LONG"}, cfg)
+        # short entry = S-25 = 4488
+        sig = evaluate_signal(4488.0, lv, {"LONG"}, cfg)
         self.assertEqual(sig.direction, "SHORT")
 
     def test_long_tp_above_entry(self):
-        sig = self._ev(4535.0)
+        sig = self._ev(4538.0)
         self.assertGreater(sig.tp_price, sig.entry_price)
 
     def test_long_sl_below_entry(self):
-        sig = self._ev(4535.0)
+        sig = self._ev(4538.0)
         self.assertLess(sig.sl_price, sig.entry_price)
 
     def test_short_tp_below_entry(self):
-        sig = self._ev(4491.0)
+        sig = self._ev(4488.0)
         self.assertLess(sig.tp_price, sig.entry_price)
 
     def test_short_sl_above_entry(self):
-        sig = self._ev(4491.0)
+        sig = self._ev(4488.0)
         self.assertGreater(sig.sl_price, sig.entry_price)
 
     def test_sl_always_defined(self):
-        for mid in [4535.0, 4491.0]:
+        for mid in [4538.0, 4488.0]:
             sig = self._ev(mid)
             self.assertIsNotNone(sig.sl_price)
             self.assertGreater(sig.sl_price, 0)

@@ -208,7 +208,7 @@ Strategy chips read `data/price_assembly/<SYMBOL>.json`:
 
 ### Start price locker only
 ```bash
-python start_price.py
+python run_start_price.py
 ```
 
 ### Full multi-symbol price runner (production)

@@ -18,11 +18,11 @@ from storage import (
     resolve_start_emergency_path,
     append_line,
 )
-from Revamp.config import list_enabled_symbols
-from Revamp.notify import (
-    send_runner_card,
-    embed_field,
-)
+from .config import list_enabled_symbols
+# from Revamp.notify import (
+#     send_runner_card,
+#     embed_field,
+# )
 
 MIDNIGHT_GRACE_MINUTES = 10
 STALE_AFTER_SECONDS = 20  # tune: 10–60
@@ -254,21 +254,21 @@ def _backfill_extremes_from_lock(symbol: str, payload: dict, cfg: PriceSettings,
 
 def send_start_runner_boot(symbols: list[str]) -> None:
     try:
-        send_runner_card(
-            "update",
-            title="🚀 Start Price Runner Initialised",
-            symbol="MULTI",
-            status="BOOT",
-            fields=[
-                embed_field("Symbols", ", ".join(symbols), False),
-                embed_field(
-                    "UTC",
-                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    False,
-                ),
-            ],
-            footer="pricing.start_price",
-        )
+        # send_runner_card(
+        #     "update",
+        #     title="🚀 Start Price Runner Initialised",
+        #     symbol="MULTI",
+        #     status="BOOT",
+        #     fields=[
+        #         embed_field("Symbols", ", ".join(symbols), False),
+        #         embed_field(
+        #             "UTC",
+        #             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        #             False,
+        #         ),
+        #     ],
+        #     footer="pricing.start_price",
+        # )
         print("✅ Startup notify sent")
     except Exception as e:
         print(f"⚠️ Startup notify failed: {e}")
@@ -482,21 +482,22 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
                 )
 
                 try:
-                    send_runner_card(
-                        "update",
-                        title="🟢 Start Price Locked",
-                        symbol=symbol,
-                        status="LOCKED",
-                        fields=[
-                            embed_field("MT5 Date", date_mt5),
-                            embed_field("Start Price", f"{float(payload['start']['price']):.5f}"),
-                            embed_field("Tick UTC", payload["start"]["locked_tick_time_utc"], False),
-                            embed_field("Server Time", payload["start"]["locked_server_time"], False),
-                            embed_field("Local Time", payload["start"]["locked_local_time"], False),
-                            embed_field("Source", payload["start"]["source"], False),
-                        ],
-                        footer="pricing.start_price",
-                    )
+                    # send_runner_card(
+                    #     "update",
+                    #     title="🟢 Start Price Locked",
+                    #     symbol=symbol,
+                    #     status="LOCKED",
+                    #     fields=[
+                    #         embed_field("MT5 Date", date_mt5),
+                    #         embed_field("Start Price", f"{float(payload['start']['price']):.5f}"),
+                    #         embed_field("Tick UTC", payload["start"]["locked_tick_time_utc"], False),
+                    #         embed_field("Server Time", payload["start"]["locked_server_time"], False),
+                    #         embed_field("Local Time", payload["start"]["locked_local_time"], False),
+                    #         embed_field("Source", payload["start"]["source"], False),
+                    #     ],
+                    #     footer="pricing.start_price",
+                    # )
+                    print("hello")
                 except Exception:
                     pass
 
@@ -537,21 +538,22 @@ def run_start_price_loop(symbol: str, cfg: PriceSettings):
                 reason_text = ", ".join(reason) if reason else "pending_lock"
 
                 try:
-                    send_runner_card(
-                        "critical",
-                        title="⚠️ Start Not Locked",
-                        symbol=symbol,
-                        status=str(payload["start"]["status"]),
-                        fields=[
-                            embed_field("MT5 Date", date_mt5),
-                            embed_field("Tick UTC", iso_z(clk.tick_time_utc), False),
-                            embed_field("Server Time", server_dt.isoformat(), False),
-                            embed_field("Local Time", local_dt.isoformat(), False),
-                            embed_field("Mid", f"{mid:.5f}"),
-                            embed_field("Reason", reason_text, False),
-                        ],
-                        footer="pricing.start_price",
-                    )
+                    # send_runner_card(
+                    #     "critical",
+                    #     title="⚠️ Start Not Locked",
+                    #     symbol=symbol,
+                    #     status=str(payload["start"]["status"]),
+                    #     fields=[
+                    #         embed_field("MT5 Date", date_mt5),
+                    #         embed_field("Tick UTC", iso_z(clk.tick_time_utc), False),
+                    #         embed_field("Server Time", server_dt.isoformat(), False),
+                    #         embed_field("Local Time", local_dt.isoformat(), False),
+                    #         embed_field("Mid", f"{mid:.5f}"),
+                    #         embed_field("Reason", reason_text, False),
+                    #     ],
+                    #     footer="pricing.start_price",
+                    # )
+                    print("hello")
                 except Exception:
                     pass
 

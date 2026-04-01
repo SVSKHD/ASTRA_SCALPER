@@ -2,10 +2,10 @@
 Revamp / astra-hawk-2026 — Shadow price reader.
 
 Standalone tick + bar writer for shadow symbols.
-Completely separate from pricing/start_price.py.
+Completely separate from pricing/run_start_price.py.
 Writes to: pricing/data/shadow_price/SYMBOL.json
 
-Zero interaction with pricing/start_price.py or its data files.
+Zero interaction with pricing/run_start_price.py or its data files.
 
 Usage:
     manager = ShadowPriceManager()        # reads list_shadow_symbols()
