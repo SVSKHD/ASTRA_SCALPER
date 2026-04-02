@@ -3,7 +3,6 @@ from __future__ import annotations
 # =============================================================================
 # STRATEGY RUNNER — MAIN LOOP
 # Reads start price from: data/start_price/<symbol>.json
-# (matches storage.resolve_start_root_path in the repo)
 # =============================================================================
 
 import time
@@ -35,6 +34,21 @@ try:
 except Exception:
     TELEGRAM = False
 
+# ── ML / LOGGING (graceful fallback if files not yet present) ─────────────
+try:
+    from signal_logger import log_signal, update_outcome as _log_update_outcome
+    SIGNAL_LOGGER = True
+except Exception as _e:
+    SIGNAL_LOGGER = False
+    print(f"[Runner] signal_logger not loaded: {_e}")
+
+try:
+    from signal_filter import apply_filters
+    SIGNAL_FILTER = True
+except Exception as _e:
+    SIGNAL_FILTER = False
+    print(f"[Runner] signal_filter not loaded: {_e}")
+
 log = logging.getLogger("runner")
 
 # IST = UTC + 5:30
@@ -44,7 +58,6 @@ _MAX_CLOSE_RETRIES = 3
 
 
 def _tg_safe(fn, *args, **kwargs):
-    """Call a Telegram notify function; swallow all exceptions."""
     if not TELEGRAM:
         return
     try:
@@ -54,12 +67,6 @@ def _tg_safe(fn, *args, **kwargs):
 
 
 def _lookup_deal_pnl(ticket: int) -> float | None:
-    """
-    Look up exact closed P&L from MT5 deal history for today.
-    Uses history_deals_get(day_start, now) filtered by magic + symbol,
-    then matches deal.position_id == ticket.
-    Returns the profit from the closing deal, or None if not yet in history.
-    """
     try:
         now = datetime.now(timezone.utc)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -81,62 +88,60 @@ def _lookup_deal_pnl(ticket: int) -> float | None:
 
 class DayState:
     def __init__(self):
-        self.date:            str                   = ""
-        self.start_price:     float | None          = None
+        self.date:            str                    = ""
+        self.start_price:     float | None           = None
         self.levels:          ThresholdLevels | None = None
-        self.already_traded:  set[Direction]        = set()
-        self.trade_count:     int                   = 0
-        # BUG 2 FIX: internal P&L tracking (independent of MT5 deal history)
-        self.internal_pnl:    float                 = 0.0
-        self._tracked_positions: list[dict]         = []
-        # BUG 3 FIX: prevent double-firing within same poll cycle
-        self.order_in_flight: bool                  = False
-        # Telegram: each notification key fires exactly once per UTC day
-        # Keys: "day_start", "loss_limit", "profit_target",
-        #       "tp_{ticket}", "sl_{ticket}", "fc_{ticket}"
-        self.notified_today:  set[str]              = set()
-        # Deal history retry tracking: ticket → retry count
-        self._close_retry_count: dict[int, int]     = {}
-        # News blackout: notify once per day
-        self.blackout_notified: bool                = False
+        self.already_traded:  set[Direction]         = set()
+        self.trade_count:     int                    = 0
+        # BUG 2 FIX: internal P&L tracking
+        self.internal_pnl:    float                  = 0.0
+        self._tracked_positions: list[dict]          = []
+        # BUG 3 FIX: prevent double-firing
+        self.order_in_flight: bool                   = False
+        # Telegram dedup
+        self.notified_today:  set[str]               = set()
+        self._close_retry_count: dict[int, int]      = {}
+        self.blackout_notified: bool                 = False
+        # ── ML TRAINING CONTEXT ───────────────────────────────────────────
+        self.prev_day_outcome:    str   = "UNKNOWN"  # TP / SL / NO_SIGNAL
+        self.consecutive_losses:  int   = 0
+        self._current_log_id:     str   = ""         # updated after close
+        self._recent_bars_m5:     list  = []         # last 40 M5 bars
 
-    def reset(self, date: str):
-        self.date           = date
-        self.start_price    = None
-        self.levels         = None
-        self.already_traded = set()
-        self.trade_count    = 0
-        self.internal_pnl   = 0.0
-        self._tracked_positions = []
-        self.order_in_flight = False
-        self.notified_today = set()
-        self._close_retry_count = {}
-        self.blackout_notified = False
+    def reset(self, date: str,
+              prev_outcome: str = "UNKNOWN",
+              consec_losses: int = 0):
+        self.date                = date
+        self.start_price         = None
+        self.levels              = None
+        self.already_traded      = set()
+        self.trade_count         = 0
+        self.internal_pnl        = 0.0
+        self._tracked_positions  = []
+        self.order_in_flight     = False
+        self.notified_today      = set()
+        self._close_retry_count  = {}
+        self.blackout_notified   = False
+        # ML context carries forward across day boundary
+        self.prev_day_outcome    = prev_outcome
+        self.consecutive_losses  = consec_losses
+        self._current_log_id     = ""
+        self._recent_bars_m5     = []
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
     def track_position(self, ticket: int, fill_price: float,
                        direction: str, volume: float,
                        sl_price: float, tp_price: float):
-        """Register a newly filled position for internal P&L tracking."""
         self._tracked_positions.append({
-            "ticket": ticket,
+            "ticket":     ticket,
             "fill_price": fill_price,
-            "direction": direction,
-            "volume": volume,
-            "sl_price": sl_price,
-            "tp_price": tp_price,
+            "direction":  direction,
+            "volume":     volume,
+            "sl_price":   sl_price,
+            "tp_price":   tp_price,
         })
 
     def update_closed_positions(self) -> list[dict]:
-        """
-        Check tracked positions against MT5 open positions.
-        If a tracked position is no longer open, read exact P&L from
-        MT5 deal history (filtered by magic + symbol + position_id).
-        Falls back to tick estimate after _MAX_CLOSE_RETRIES poll cycles.
-
-        Returns list of dicts for each confirmed closed position:
-          {"ticket", "direction", "fill_price", "sl_price", "tp_price", "pnl"}
-        """
         if not self._tracked_positions:
             return []
 
@@ -150,54 +155,35 @@ class DayState:
                 continue
 
             ticket = pos["ticket"]
-
-            # Try exact P&L from MT5 deal history
             pnl = _lookup_deal_pnl(ticket)
 
             if pnl is None:
-                # Deal not yet in history — retry or fall back to estimate
                 retries = self._close_retry_count.get(ticket, 0)
                 if retries < _MAX_CLOSE_RETRIES:
                     self._close_retry_count[ticket] = retries + 1
-                    log.info(
-                        f"[{cfg.symbol}] Position #{ticket} closed but deal not in history "
-                        f"(retry {retries + 1}/{_MAX_CLOSE_RETRIES})"
-                    )
-                    # Keep in tracked list — will retry next poll cycle
+                    log.info(f"[{cfg.symbol}] #{ticket} not in history yet (retry {retries+1}/{_MAX_CLOSE_RETRIES})")
                     still_open.append(pos)
                     continue
-
-                # Max retries exhausted — fall back to tick estimate
-                log.warning(
-                    f"[{cfg.symbol}] Position #{ticket} deal history unavailable after "
-                    f"{_MAX_CLOSE_RETRIES} retries — using tick estimate"
-                )
+                log.warning(f"[{cfg.symbol}] #{ticket} deal history unavailable — using tick estimate")
                 tick = mt5.symbol_info_tick(cfg.symbol)
                 if tick is not None:
                     if pos["direction"] == "LONG":
-                        close_est = float(tick.bid)
-                        pnl = (close_est - pos["fill_price"]) * pos["volume"] * cfg.pip_value_per_lot
+                        pnl = (float(tick.bid) - pos["fill_price"]) * pos["volume"] * cfg.pip_value_per_lot
                     else:
-                        close_est = float(tick.ask)
-                        pnl = (pos["fill_price"] - close_est) * pos["volume"] * cfg.pip_value_per_lot
+                        pnl = (pos["fill_price"] - float(tick.ask)) * pos["volume"] * cfg.pip_value_per_lot
                 else:
                     pnl = -cfg.sl_dollar
 
-            # Clean up retry counter
             self._close_retry_count.pop(ticket, None)
-
             self.internal_pnl += pnl
-            log.info(
-                f"[{cfg.symbol}] Position #{ticket} closed | "
-                f"pnl: {pnl:+.2f} | internal_pnl total: {self.internal_pnl:+.2f}"
-            )
+            log.info(f"[{cfg.symbol}] #{ticket} closed | pnl={pnl:+.2f} | total={self.internal_pnl:+.2f}")
             closed.append({
-                "ticket": ticket,
-                "direction": pos["direction"],
+                "ticket":     ticket,
+                "direction":  pos["direction"],
                 "fill_price": pos["fill_price"],
-                "sl_price": pos["sl_price"],
-                "tp_price": pos["tp_price"],
-                "pnl": pnl,
+                "sl_price":   pos["sl_price"],
+                "tp_price":   pos["tp_price"],
+                "pnl":        pnl,
             })
 
         self._tracked_positions = still_open
@@ -205,7 +191,6 @@ class DayState:
 
 
 def _today() -> str:
-    """UTC calendar date — matches date_mt5 written by start_price.py."""
     return _utc_date_today()
 
 
@@ -218,7 +203,6 @@ def _mid(symbol: str) -> float | None:
 
 
 def _live_fill_price(symbol: str, direction: str) -> float | None:
-    """Get the current ask (LONG) or bid (SHORT) — the price MT5 would fill at."""
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         return None
@@ -227,19 +211,30 @@ def _live_fill_price(symbol: str, direction: str) -> float | None:
 
 def _snapshot(trade_count: int, internal_pnl: float) -> RiskSnapshot:
     mt5_pnl = calculate_day_pnl(cfg)
-    # BUG 2 FIX: use the worse of MT5 history P&L and internal tracking
     effective_pnl = min(mt5_pnl, internal_pnl) if internal_pnl < 0 else mt5_pnl
     if internal_pnl < mt5_pnl:
-        log.warning(
-            f"[{cfg.symbol}] INTERNAL P&L ({internal_pnl:+.2f}) worse than "
-            f"MT5 history ({mt5_pnl:+.2f}) — using internal value"
-        )
+        log.warning(f"[{cfg.symbol}] INTERNAL P&L ({internal_pnl:+.2f}) worse than MT5 ({mt5_pnl:+.2f})")
     return RiskSnapshot(
         realized_pnl        = effective_pnl,
         open_pnl            = calculate_open_pnl(cfg),
         trade_count         = trade_count,
         open_position_count = len(get_open_positions(cfg)),
     )
+
+
+def _fetch_m5_bars(symbol: str, count: int = 40) -> list:
+    """Fetch last N closed M5 bars as list of dicts. Returns [] on failure."""
+    try:
+        bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, count)
+        if bars is None or len(bars) == 0:
+            return []
+        return [
+            {"open": float(b[1]), "high": float(b[2]),
+             "low":  float(b[3]), "close": float(b[4])}
+            for b in bars
+        ]
+    except Exception:
+        return []
 
 
 def _force_close(state: DayState):
@@ -249,11 +244,9 @@ def _force_close(state: DayState):
         print(f"  {'OK' if r['success'] else 'FAIL'} ticket={r['ticket']} retcode={r['retcode']}")
     pnl = calculate_day_pnl(cfg)
 
-    # Telegram: notify each force-closed position (with dedup)
     for r in results:
         fc_key = f"fc_{r['ticket']}"
         if TELEGRAM and fc_key not in state.notified_today:
-            # Look up fill_price from tracked positions if available
             fill = 0.0
             for pos in state._tracked_positions:
                 if pos["ticket"] == r["ticket"]:
@@ -271,13 +264,64 @@ def _force_close(state: DayState):
         f"  Realized   : ${pnl:+.2f}\n"
         f"───────────────────────────────────────\n"
     )
-
-    # Telegram: end-of-day summary
     _tg_safe(notify_day_end, cfg.symbol, state.date, state.trade_count, pnl)
 
 
 def _handle_signal(signal: Signal, state: DayState) -> bool:
-    # BUG 1 FIX: overshoot filter — check live fill price vs entry level
+
+    # ── Fetch current spread ──────────────────────────────────────────────
+    spread_pips = 0.0
+    tick = mt5.symbol_info_tick(cfg.symbol)
+    if tick:
+        spread_pips = round(float(tick.ask) - float(tick.bid), 2)
+
+    # ── Session context for filters ───────────────────────────────────────
+    now_utc     = datetime.now(timezone.utc)
+    hour_utc    = now_utc.hour
+    day_of_week = now_utc.weekday()   # 0=Mon, 4=Fri
+
+    # ── RULE-BASED FILTERS ────────────────────────────────────────────────
+    filter_reason = ""
+    if SIGNAL_FILTER:
+        result = apply_filters(
+            bars_m5       = state._recent_bars_m5,
+            hour_utc      = hour_utc,
+            day_of_week   = day_of_week,
+            enable_atr    = True,
+            enable_candle = True,
+            enable_session= True,
+        )
+        if not result.passed:
+            filter_reason = result.reason
+            print(f"[{cfg.symbol}] SIGNAL FILTERED | {signal.direction} | {filter_reason}")
+            # Log the skipped signal for ML training data
+            if SIGNAL_LOGGER:
+                log_signal(
+                    signal             = signal,
+                    bars_m5            = state._recent_bars_m5,
+                    spread_pips        = spread_pips,
+                    prev_day_outcome   = state.prev_day_outcome,
+                    consecutive_losses = state.consecutive_losses,
+                    filter_applied     = filter_reason,
+                    outcome            = "SKIPPED",
+                )
+            return False
+
+    # ── LOG SIGNAL (will be traded — outcome=PENDING) ─────────────────────
+    log_id = ""
+    if SIGNAL_LOGGER:
+        log_id = log_signal(
+            signal             = signal,
+            bars_m5            = state._recent_bars_m5,
+            spread_pips        = spread_pips,
+            prev_day_outcome   = state.prev_day_outcome,
+            consecutive_losses = state.consecutive_losses,
+            filter_applied     = "",
+            outcome            = "PENDING",
+        )
+        state._current_log_id = log_id
+
+    # ── BUG 1 FIX: overshoot filter ──────────────────────────────────────
     fill_price_est = _live_fill_price(cfg.symbol, signal.direction)
     if fill_price_est is not None:
         if signal.direction == "LONG":
@@ -287,26 +331,25 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
         if overshoot > cfg.max_entry_overshoot_pips:
             log.warning(
                 f"[{cfg.symbol}] OVERSHOOT BLOCKED | {signal.direction} | "
-                f"fill_est={fill_price_est:.2f} | entry={signal.entry_price:.2f} | "
-                f"overshoot={overshoot:.2f} pips > max={cfg.max_entry_overshoot_pips:.1f}"
+                f"overshoot={overshoot:.2f} > max={cfg.max_entry_overshoot_pips}"
             )
-            print(
-                f"[{cfg.symbol}] OVERSHOOT BLOCKED | {signal.direction} | "
-                f"overshoot={overshoot:.2f} pips > max {cfg.max_entry_overshoot_pips:.1f} pips"
-            )
+            print(f"[{cfg.symbol}] OVERSHOOT BLOCKED | overshoot={overshoot:.2f} pips")
+            if SIGNAL_LOGGER and log_id:
+                _log_update_outcome(log_id, "SKIPPED", 0.0)
             return False
 
-    snap    = _snapshot(state.trade_count, state.internal_pnl)
+    snap = _snapshot(state.trade_count, state.internal_pnl)
     allowed, reason = can_place_trade(snap, cfg)
-
     if not allowed:
         print(f"[{cfg.symbol}] BLOCKED | {reason}")
+        if SIGNAL_LOGGER and log_id:
+            _log_update_outcome(log_id, "SKIPPED", 0.0)
         return False
 
     print(f"\n[{cfg.symbol}] {signal}")
     print(loss_scenario_summary(snap.realized_pnl, cfg))
 
-    # BUG 3 FIX: set order_in_flight before place_order
+    # BUG 3 FIX: order in flight guard
     state.order_in_flight = True
     result = place_order(signal, cfg)
     state.order_in_flight = False
@@ -315,16 +358,15 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
         state.already_traded.add(signal.direction)
         state.trade_count += 1
 
-        # BUG 2 FIX: track position for internal P&L
-        ticket = result.get("order", 0)
+        ticket      = result.get("order", 0)
         actual_fill = result.get("fill_price", signal.entry_price)
         state.track_position(
-            ticket=ticket,
-            fill_price=actual_fill,
-            direction=signal.direction,
-            volume=cfg.lot_size,
-            sl_price=signal.sl_price,
-            tp_price=signal.tp_price,
+            ticket     = ticket,
+            fill_price = actual_fill,
+            direction  = signal.direction,
+            volume     = cfg.lot_size,
+            sl_price   = signal.sl_price,
+            tp_price   = signal.tp_price,
         )
 
         post   = calculate_day_pnl(cfg)
@@ -339,8 +381,6 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             f"  Budget left: ${budget:.0f}\n"
             f"  Profit tgt : +${cfg.daily_profit_target_usd:.0f}"
         )
-
-        # Telegram: trade placed
         _tg_safe(
             notify_trade_placed,
             cfg.symbol, signal.direction, actual_fill,
@@ -350,11 +390,12 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
         return True
 
     print(f"[{cfg.symbol}] ORDER FAILED | retcode={result.get('retcode')} | {result.get('comment')}")
+    if SIGNAL_LOGGER and log_id:
+        _log_update_outcome(log_id, "SKIPPED", 0.0)
     return False
 
 
 def _print_day_levels(levels: ThresholdLevels):
-    """Print today's start price levels with IST equivalent time."""
     now_utc = datetime.now(timezone.utc)
     ist_time = now_utc.astimezone(_IST)
     utc_midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -379,14 +420,21 @@ def run():
 
     print(f"[{cfg.symbol}] Waiting for start price...")
     print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
+    if SIGNAL_LOGGER:
+        print(f"[{cfg.symbol}] Signal logger  : ACTIVE  → data/signal_log.csv")
+    if SIGNAL_FILTER:
+        print(f"[{cfg.symbol}] Rule filters   : ACTIVE  → ATR / candle / session")
 
     while True:
         try:
             today = _today()
 
-            # ── DATE ROLLOVER (UTC midnight) ─────────────────────────────────
+            # ── DATE ROLLOVER ────────────────────────────────────────────────
             if today != state.date:
-                state.reset(today)
+                # Carry ML context forward before reset
+                _prev    = state.prev_day_outcome
+                _consec  = state.consecutive_losses
+                state.reset(today, _prev, _consec)
                 force_closed = False
 
             # ── START PRICE ──────────────────────────────────────────────────
@@ -399,7 +447,6 @@ def run():
                 state.levels      = compute_levels(price, cfg)
                 _print_day_levels(state.levels)
 
-                # Telegram: day start notification (once per day)
                 if TELEGRAM and "day_start" not in state.notified_today:
                     lv = state.levels
                     _tg_safe(
@@ -439,7 +486,6 @@ def run():
                         _tg_send_fn(
                             f"<b>NEWS BLACKOUT — {cfg.symbol}</b>\n"
                             f"Date: {today}\nTrading suspended all day.\n"
-                            f"{_now_ist()}"
                         )
                     except Exception as e:
                         print(f"[Telegram] Send failed: {repr(e)}")
@@ -447,41 +493,51 @@ def run():
                 time.sleep(60.0)
                 continue
 
-            # ── BUG 2 FIX: update internal P&L from closed positions ────────
+            # ── FETCH M5 BARS (for ML features + ATR filter) ─────────────────
+            bars = _fetch_m5_bars(cfg.symbol, 40)
+            if bars:
+                state._recent_bars_m5 = bars
+
+            # ── BUG 2 FIX: update closed positions ───────────────────────────
             closed_positions = state.update_closed_positions()
 
-            # Telegram: notify TP/SL for each closed position (with dedup)
+            # Telegram + ML outcome update for each closed position
             for cp in closed_positions:
                 ticket = cp["ticket"]
-                pnl = cp["pnl"]
+                pnl    = cp["pnl"]
+
                 if pnl > 0:
                     tp_key = f"tp_{ticket}"
                     if TELEGRAM and tp_key not in state.notified_today:
-                        _tg_safe(
-                            notify_tp,
-                            cfg.symbol, cp["direction"], cp["fill_price"],
-                            cp["tp_price"], pnl,
-                        )
+                        _tg_safe(notify_tp, cfg.symbol, cp["direction"],
+                                 cp["fill_price"], cp["tp_price"], pnl)
                         state.notified_today.add(tp_key)
                 elif pnl < 0:
                     sl_key = f"sl_{ticket}"
                     if TELEGRAM and sl_key not in state.notified_today:
-                        _tg_safe(
-                            notify_sl,
-                            cfg.symbol, cp["direction"], cp["fill_price"],
-                            cp["sl_price"], pnl,
-                        )
+                        _tg_safe(notify_sl, cfg.symbol, cp["direction"],
+                                 cp["fill_price"], cp["sl_price"], pnl)
                         state.notified_today.add(sl_key)
                 else:
                     fc_key = f"fc_{ticket}"
                     if TELEGRAM and fc_key not in state.notified_today:
-                        _tg_safe(
-                            notify_force_close,
-                            cfg.symbol, cp["fill_price"], cp["fill_price"], 0.0,
-                        )
+                        _tg_safe(notify_force_close, cfg.symbol,
+                                 cp["fill_price"], cp["fill_price"], 0.0)
                         state.notified_today.add(fc_key)
 
-            # Use worse of MT5 history and internal tracking for P&L checks
+                # ── ML: update outcome + streak tracking ─────────────────────
+                if SIGNAL_LOGGER and state._current_log_id:
+                    outcome_str = "TP" if pnl > 0 else ("SL" if pnl < 0 else "FC")
+                    _log_update_outcome(state._current_log_id, outcome_str, pnl)
+                    state._current_log_id = ""
+                    if outcome_str == "SL":
+                        state.consecutive_losses += 1
+                        state.prev_day_outcome    = "SL"
+                    elif outcome_str == "TP":
+                        state.consecutive_losses  = 0
+                        state.prev_day_outcome    = "TP"
+
+            # ── P&L checks ───────────────────────────────────────────────────
             mt5_realized = calculate_day_pnl(cfg)
             realized = min(mt5_realized, state.internal_pnl) if state.internal_pnl < 0 else mt5_realized
 
@@ -489,12 +545,8 @@ def run():
             if is_daily_profit_hit(realized, cfg):
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
-                    print(
-                        f"[{cfg.symbol}] PROFIT TARGET HIT | "
-                        f"PnL=${realized:+.2f} | target=+${cfg.daily_profit_target_usd:.0f}"
-                    )
+                    print(f"[{cfg.symbol}] PROFIT TARGET HIT | PnL=${realized:+.2f}")
                     last_warn_ts = now
-                # Telegram: one-time profit target notification
                 if TELEGRAM and "profit_target" not in state.notified_today:
                     _tg_safe(notify_profit_target, cfg.symbol, realized)
                     state.notified_today.add("profit_target")
@@ -506,17 +558,8 @@ def run():
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
                     src = "internal" if state.internal_pnl < mt5_realized else "MT5"
-                    print(
-                        f"[{cfg.symbol}] LOSS LIMIT BREACHED ({src}) | "
-                        f"PnL=${realized:+.2f} | limit=-${cfg.max_daily_loss_usd:.0f}"
-                    )
-                    if state.internal_pnl < mt5_realized:
-                        log.warning(
-                            f"[{cfg.symbol}] Internal P&L ({state.internal_pnl:+.2f}) "
-                            f"breached limit before MT5 history ({mt5_realized:+.2f}) caught up"
-                        )
+                    print(f"[{cfg.symbol}] LOSS LIMIT BREACHED ({src}) | PnL=${realized:+.2f}")
                     last_warn_ts = now
-                # Telegram: one-time loss limit notification
                 if TELEGRAM and "loss_limit" not in state.notified_today:
                     _tg_safe(notify_loss_limit, cfg.symbol, realized)
                     state.notified_today.add("loss_limit")
@@ -528,7 +571,7 @@ def run():
                 time.sleep(5.0)
                 continue
 
-            # ── BUG 3 FIX: skip if order is in flight ───────────────────────
+            # ── BUG 3 FIX: order in flight ───────────────────────────────────
             if state.order_in_flight:
                 time.sleep(cfg.poll_seconds)
                 continue
@@ -553,7 +596,7 @@ def run():
                 )
                 last_log_ts = now
 
-            # ── SIGNAL → RISK GATE → ORDER ───────────────────────────────────
+            # ── SIGNAL → FILTER → LOG → ORDER ────────────────────────────────
             sig = evaluate_signal(mid, state.levels, state.already_traded, cfg)
             if sig:
                 _handle_signal(sig, state)
@@ -566,7 +609,7 @@ def run():
             break
         except Exception as e:
             print(f"[{cfg.symbol}] Error: {repr(e)}")
-            state.order_in_flight = False  # Reset on error to avoid permanent lock
+            state.order_in_flight = False
             time.sleep(2.0)
 
 

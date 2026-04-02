@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TOKEN   = "7341988489:AAG5m0fqUs8mu1ZyMrXWBFVFVmzme09Ns8k"
-CHAT_ID = "7341988489"   # ← paste your Telegram chat_id here (get it from @userinfobot)
+CHAT_ID = "1353536439"   # ← paste your Telegram chat_id here (get it from @userinfobot)
 # ─────────────────────────────────────────────────────────────────────────────
 
 

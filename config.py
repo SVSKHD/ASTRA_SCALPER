@@ -55,7 +55,7 @@ class StrategyConfig:
     max_daily_loss_usd:       float = 200.0  # stop after 1 SL hit (-$200)
 
     # ── TRADE LIMITS ──────────────────────────────────────
-    max_trades_per_day: int = 2
+    max_trades_per_day: int = 1
     direction_mode: Literal["first_only", "both"] = "both"
 
     # ── ENTRY OVERSHOOT FILTER ────────────────────────────
