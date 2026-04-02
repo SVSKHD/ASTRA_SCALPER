@@ -11,7 +11,7 @@ import MetaTrader5 as mt5
 from datetime import datetime, timezone, timedelta
 
 from config import cfg
-from start_reader import read_start_price, _utc_date_today
+from start_reader import read_start_price, read_start_payload, _utc_date_today
 from threshold import compute_levels, ThresholdLevels
 from trade_signal import evaluate_signal, Signal, Direction
 from session_guard import is_session_allowed, is_force_close_time, is_news_blackout_day, session_status
@@ -427,20 +427,43 @@ def run():
 
     while True:
         try:
-            today = _today()
+            # ── DATE ROLLOVER — driven by start_price file, NOT UTC clock ────
+            # Only reset when run_start_price.py has LOCKED a new day's price.
+            # This prevents the "limbo" state where state.date=Apr3 but
+            # start_price file still shows Apr2 (not yet locked).
+            today_utc = _today()   # UTC wall clock date
 
-            # ── DATE ROLLOVER ────────────────────────────────────────────────
-            if today != state.date:
-                # Carry ML context forward before reset
-                _prev    = state.prev_day_outcome
-                _consec  = state.consecutive_losses
-                state.reset(today, _prev, _consec)
-                force_closed = False
+            # ── DATE ROLLOVER — file-driven, forward-only ────────────────────
+            # Reset ONLY when start_price file shows a new date that is:
+            #   1. LOCKED
+            #   2. Different from current state.date
+            #   3. Equal to today's UTC date (never reset backward to a past date)
+            #
+            # This prevents the "limbo" bug where:
+            #   - Bot starts on Apr 3 UTC
+            #   - File still has Apr 2 (not yet locked for Apr 3)
+            #   - Old logic reset backward to Apr 2 → picked up Apr 2's -$526 P&L
+            payload = read_start_payload(cfg)
+            if payload:
+                file_date   = payload.get("date_mt5", "")
+                file_status = (payload.get("start") or {}).get("status", "")
+                if (file_date
+                        and file_status == "LOCKED"
+                        and file_date != state.date
+                        and file_date >= today_utc):   # ← forward-only guard
+                    _prev   = state.prev_day_outcome
+                    _consec = state.consecutive_losses
+                    state.reset(file_date, _prev, _consec)
+                    force_closed = False
+                    print(f"[{cfg.symbol}] DAY ROLLOVER → {file_date}")
+
+            today = today_utc
 
             # ── START PRICE ──────────────────────────────────────────────────
             if state.start_price is None:
                 price = read_start_price(cfg)
                 if price is None:
+                    # File not locked for today yet — wait quietly
                     time.sleep(2.0)
                     continue
                 state.start_price = price

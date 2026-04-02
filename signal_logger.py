@@ -45,7 +45,7 @@ import logging
 
 log = logging.getLogger("signal_logger")
 
-_CSV_PATH = os.path.join("data", "signal_log.csv")
+_CSV_PATH = os.path.join("log_data", "signal_log.csv")
 _FIELDNAMES = [
     "id", "date", "time_utc", "direction",
     "start_price", "entry_price", "tp_price", "sl_price",
