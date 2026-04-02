@@ -15,7 +15,7 @@ from config import cfg
 from start_reader import read_start_price, _utc_date_today
 from threshold import compute_levels, ThresholdLevels
 from trade_signal import evaluate_signal, Signal, Direction
-from session_guard import is_session_allowed, is_force_close_time, session_status
+from session_guard import is_session_allowed, is_force_close_time, is_news_blackout_day, session_status
 from risk_control import (
     RiskSnapshot, can_place_trade,
     is_daily_limit_breached, is_daily_profit_hit,
@@ -97,6 +97,8 @@ class DayState:
         self.notified_today:  set[str]              = set()
         # Deal history retry tracking: ticket → retry count
         self._close_retry_count: dict[int, int]     = {}
+        # News blackout: notify once per day
+        self.blackout_notified: bool                = False
 
     def reset(self, date: str):
         self.date           = date
@@ -109,6 +111,7 @@ class DayState:
         self.order_in_flight = False
         self.notified_today = set()
         self._close_retry_count = {}
+        self.blackout_notified = False
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
     def track_position(self, ticket: int, fill_price: float,
@@ -422,6 +425,26 @@ def run():
             # ── SESSION GATE ─────────────────────────────────────────────────
             if not is_session_allowed(cfg):
                 time.sleep(5.0)
+                continue
+
+            # ── NEWS BLACKOUT DAY ────────────────────────────────────────────
+            if is_news_blackout_day(cfg):
+                now = time.time()
+                if now - last_warn_ts >= 3600.0:
+                    print(f"[{cfg.symbol}] NEWS BLACKOUT DAY — trading suspended")
+                    last_warn_ts = now
+                if TELEGRAM and not state.blackout_notified:
+                    try:
+                        from telegram_notify import _now_ist, send as _tg_send_fn
+                        _tg_send_fn(
+                            f"<b>NEWS BLACKOUT — {cfg.symbol}</b>\n"
+                            f"Date: {today}\nTrading suspended all day.\n"
+                            f"{_now_ist()}"
+                        )
+                    except Exception as e:
+                        print(f"[Telegram] Send failed: {repr(e)}")
+                    state.blackout_notified = True
+                time.sleep(60.0)
                 continue
 
             # ── BUG 2 FIX: update internal P&L from closed positions ────────
