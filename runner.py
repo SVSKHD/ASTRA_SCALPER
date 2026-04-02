@@ -7,8 +7,9 @@ from __future__ import annotations
 # =============================================================================
 
 import time
+import logging
 import MetaTrader5 as mt5
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import cfg
 from start_reader import read_start_price, _utc_date_today
@@ -25,6 +26,11 @@ from executor import (
     calculate_day_pnl, calculate_open_pnl, get_open_positions,
 )
 
+log = logging.getLogger("runner")
+
+# IST = UTC + 5:30
+_IST = timezone(timedelta(hours=5, minutes=30))
+
 
 class DayState:
     def __init__(self):
@@ -33,6 +39,11 @@ class DayState:
         self.levels:          ThresholdLevels | None = None
         self.already_traded:  set[Direction]        = set()
         self.trade_count:     int                   = 0
+        # BUG 2 FIX: internal P&L tracking (independent of MT5 deal history)
+        self.internal_pnl:    float                 = 0.0
+        self._tracked_positions: list[dict]         = []
+        # BUG 3 FIX: prevent double-firing within same poll cycle
+        self.order_in_flight: bool                  = False
 
     def reset(self, date: str):
         self.date           = date
@@ -40,7 +51,61 @@ class DayState:
         self.levels         = None
         self.already_traded = set()
         self.trade_count    = 0
+        self.internal_pnl   = 0.0
+        self._tracked_positions = []
+        self.order_in_flight = False
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
+
+    def track_position(self, ticket: int, fill_price: float,
+                       direction: str, volume: float,
+                       sl_price: float, tp_price: float):
+        """Register a newly filled position for internal P&L tracking."""
+        self._tracked_positions.append({
+            "ticket": ticket,
+            "fill_price": fill_price,
+            "direction": direction,
+            "volume": volume,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+        })
+
+    def update_closed_positions(self):
+        """
+        Check tracked positions against MT5 open positions.
+        If a tracked position is no longer open, calculate its P&L
+        from the current tick and add to internal_pnl.
+        """
+        if not self._tracked_positions:
+            return
+
+        open_tickets = {p.ticket for p in get_open_positions(cfg)}
+        still_open = []
+
+        for pos in self._tracked_positions:
+            if pos["ticket"] in open_tickets:
+                still_open.append(pos)
+                continue
+
+            # Position closed — estimate P&L from current price
+            tick = mt5.symbol_info_tick(cfg.symbol)
+            if tick is not None:
+                if pos["direction"] == "LONG":
+                    close_est = float(tick.bid)
+                    pnl = (close_est - pos["fill_price"]) * pos["volume"] * cfg.pip_value_per_lot
+                else:
+                    close_est = float(tick.ask)
+                    pnl = (pos["fill_price"] - close_est) * pos["volume"] * cfg.pip_value_per_lot
+            else:
+                # No tick available — assume worst case (SL hit)
+                pnl = -cfg.sl_dollar
+
+            self.internal_pnl += pnl
+            log.info(
+                f"[{cfg.symbol}] Position #{pos['ticket']} closed | "
+                f"internal_pnl update: {pnl:+.2f} → total: {self.internal_pnl:+.2f}"
+            )
+
+        self._tracked_positions = still_open
 
 
 def _today() -> str:
@@ -56,9 +121,25 @@ def _mid(symbol: str) -> float | None:
     return (bid + ask) / 2.0 if bid > 0 and ask > 0 else None
 
 
-def _snapshot(trade_count: int) -> RiskSnapshot:
+def _live_fill_price(symbol: str, direction: str) -> float | None:
+    """Get the current ask (LONG) or bid (SHORT) — the price MT5 would fill at."""
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    return float(tick.ask) if direction == "LONG" else float(tick.bid)
+
+
+def _snapshot(trade_count: int, internal_pnl: float) -> RiskSnapshot:
+    mt5_pnl = calculate_day_pnl(cfg)
+    # BUG 2 FIX: use the worse of MT5 history P&L and internal tracking
+    effective_pnl = min(mt5_pnl, internal_pnl) if internal_pnl < 0 else mt5_pnl
+    if internal_pnl < mt5_pnl:
+        log.warning(
+            f"[{cfg.symbol}] ⚠️ INTERNAL P&L ({internal_pnl:+.2f}) worse than "
+            f"MT5 history ({mt5_pnl:+.2f}) — using internal value"
+        )
     return RiskSnapshot(
-        realized_pnl        = calculate_day_pnl(cfg),
+        realized_pnl        = effective_pnl,
         open_pnl            = calculate_open_pnl(cfg),
         trade_count         = trade_count,
         open_position_count = len(get_open_positions(cfg)),
@@ -80,7 +161,26 @@ def _force_close(state: DayState):
 
 
 def _handle_signal(signal: Signal, state: DayState) -> bool:
-    snap    = _snapshot(state.trade_count)
+    # BUG 1 FIX: overshoot filter — check live fill price vs entry level
+    fill_price_est = _live_fill_price(cfg.symbol, signal.direction)
+    if fill_price_est is not None:
+        if signal.direction == "LONG":
+            overshoot = fill_price_est - signal.entry_price
+        else:
+            overshoot = signal.entry_price - fill_price_est
+        if overshoot > cfg.max_entry_overshoot_pips:
+            log.warning(
+                f"[{cfg.symbol}] ⚠️ OVERSHOOT BLOCKED | {signal.direction} | "
+                f"fill_est={fill_price_est:.2f} | entry={signal.entry_price:.2f} | "
+                f"overshoot={overshoot:.2f} pips > max={cfg.max_entry_overshoot_pips:.1f}"
+            )
+            print(
+                f"[{cfg.symbol}] ⚠️ OVERSHOOT BLOCKED | {signal.direction} | "
+                f"overshoot={overshoot:.2f} pips > max {cfg.max_entry_overshoot_pips:.1f} pips"
+            )
+            return False
+
+    snap    = _snapshot(state.trade_count, state.internal_pnl)
     allowed, reason = can_place_trade(snap, cfg)
 
     if not allowed:
@@ -90,17 +190,33 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
     print(f"\n[{cfg.symbol}] 🎯 {signal}")
     print(loss_scenario_summary(snap.realized_pnl, cfg))
 
+    # BUG 3 FIX: set order_in_flight before place_order
+    state.order_in_flight = True
     result = place_order(signal, cfg)
+    state.order_in_flight = False
 
     if result.get("success"):
         state.already_traded.add(signal.direction)
         state.trade_count += 1
+
+        # BUG 2 FIX: track position for internal P&L
+        ticket = result.get("order", 0)
+        actual_fill = result.get("fill_price", signal.entry_price)
+        state.track_position(
+            ticket=ticket,
+            fill_price=actual_fill,
+            direction=signal.direction,
+            volume=cfg.lot_size,
+            sl_price=signal.sl_price,
+            tp_price=signal.tp_price,
+        )
+
         post   = calculate_day_pnl(cfg)
         budget = cfg.max_daily_loss_usd - abs(min(post, 0))
         print(
             f"[{cfg.symbol}] ✅ Trade #{state.trade_count} PLACED\n"
             f"  Direction  : {signal.direction}\n"
-            f"  Fill       : {result.get('fill_price', 'N/A')}\n"
+            f"  Fill       : {actual_fill}\n"
             f"  TP         : {signal.tp_price:.2f}\n"
             f"  SL         : {signal.sl_price:.2f}\n"
             f"  Day PnL    : ${post:+.2f}\n"
@@ -111,6 +227,19 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
 
     print(f"[{cfg.symbol}] ❌ ORDER FAILED | retcode={result.get('retcode')} | {result.get('comment')}")
     return False
+
+
+def _print_day_levels(levels: ThresholdLevels):
+    """Print today's start price levels with IST equivalent time."""
+    now_utc = datetime.now(timezone.utc)
+    ist_time = now_utc.astimezone(_IST)
+    utc_midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    ist_midnight = utc_midnight.astimezone(_IST)
+    print(
+        f"  Start price locked at: UTC 00:00 (IST {ist_midnight.strftime('%H:%M')})\n"
+        f"  Current IST time    : {ist_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    print(levels.display())
 
 
 def run():
@@ -144,7 +273,7 @@ def run():
                     continue
                 state.start_price = price
                 state.levels      = compute_levels(price, cfg)
-                print(state.levels.display())
+                _print_day_levels(state.levels)
 
             # ── FORCE CLOSE ──────────────────────────────────────────────────
             if is_force_close_time(cfg) and not force_closed:
@@ -162,7 +291,12 @@ def run():
                 time.sleep(5.0)
                 continue
 
-            realized = calculate_day_pnl(cfg)
+            # ── BUG 2 FIX: update internal P&L from closed positions ────────
+            state.update_closed_positions()
+
+            # Use worse of MT5 history and internal tracking for P&L checks
+            mt5_realized = calculate_day_pnl(cfg)
+            realized = min(mt5_realized, state.internal_pnl) if state.internal_pnl < 0 else mt5_realized
 
             # ── DAILY PROFIT STOP ────────────────────────────────────────────
             if is_daily_profit_hit(realized, cfg):
@@ -180,10 +314,16 @@ def run():
             if is_daily_limit_breached(realized, cfg):
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
+                    src = "internal" if state.internal_pnl < mt5_realized else "MT5"
                     print(
-                        f"[{cfg.symbol}] ⛔ LOSS LIMIT BREACHED | "
+                        f"[{cfg.symbol}] ⛔ LOSS LIMIT BREACHED ({src}) | "
                         f"PnL=${realized:+.2f} | limit=-${cfg.max_daily_loss_usd:.0f}"
                     )
+                    if state.internal_pnl < mt5_realized:
+                        log.warning(
+                            f"[{cfg.symbol}] ⚠️ Internal P&L ({state.internal_pnl:+.2f}) "
+                            f"breached limit before MT5 history ({mt5_realized:+.2f}) caught up"
+                        )
                     last_warn_ts = now
                 time.sleep(10.0)
                 continue
@@ -191,6 +331,11 @@ def run():
             # ── MAX TRADES ───────────────────────────────────────────────────
             if state.trade_count >= cfg.max_trades_per_day:
                 time.sleep(5.0)
+                continue
+
+            # ── BUG 3 FIX: skip if order is in flight ───────────────────────
+            if state.order_in_flight:
+                time.sleep(cfg.poll_seconds)
                 continue
 
             # ── PRICE ────────────────────────────────────────────────────────
@@ -226,6 +371,7 @@ def run():
             break
         except Exception as e:
             print(f"[{cfg.symbol}] ⚠️ Error: {repr(e)}")
+            state.order_in_flight = False  # Reset on error to avoid permanent lock
             time.sleep(2.0)
 
 
