@@ -28,7 +28,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Literal
+from typing import Literal, Optional
 
 try:
     import MetaTrader5 as mt5
@@ -83,6 +83,7 @@ class TradeRecord:
     gross_pnl:   float = 0.0
     spread_cost: float = 0.0
     net_pnl:     float = 0.0
+    be_triggered: bool = False
 
 
 @dataclass
@@ -99,6 +100,8 @@ class DayReport:
     hit_loss:         bool  = False
     hit_consec_pause: bool  = False
     no_trigger:       bool  = False
+    threshold_used:   float = 0.0    # dynamic threshold for this day (0=static)
+    be_triggered:     bool  = False   # any trade hit breakeven stop
 
 
 # =============================================================================
@@ -173,6 +176,57 @@ def group_by_day(bars: list[Bar], server_utc_offset: int = 0) -> dict[str, list[
         key = bar.time_utc.strftime("%Y-%m-%d")
         day_map[key].append(bar)
     return dict(sorted(day_map.items()))
+
+
+# =============================================================================
+# DYNAMIC THRESHOLD — ATR
+# =============================================================================
+
+def compute_atr(bars: list[Bar], period: int = 14) -> float:
+    """Compute ATR from M5 bars (uses true range: max of H-L, |H-prevC|, |L-prevC|)."""
+    if len(bars) < 2:
+        return 0.0
+    trs: list[float] = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i].high, bars[i].low, bars[i - 1].close
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return sum(trs) / len(trs) if trs else 0.0
+    # Simple moving average of last `period` true ranges
+    return sum(trs[-period:]) / period
+
+
+def compute_dynamic_threshold(
+    prev_day_bars: list[Bar],
+    atr_period: int = 14,
+    atr_multiplier: float = 1.0,
+    clamp_min: float = 10.0,
+    clamp_max: float = 50.0,
+) -> float:
+    """ATR-based dynamic threshold, clamped to [clamp_min, clamp_max] pips."""
+    atr_val = compute_atr(prev_day_bars, atr_period)
+    threshold = atr_val * atr_multiplier
+    return max(clamp_min, min(clamp_max, round(threshold, 1)))
+
+
+# =============================================================================
+# TIME FILTER — BLACKOUT WINDOWS
+# =============================================================================
+
+BLACKOUT_WINDOWS = [
+    ("00:00", "01:00"),   # midnight thin market
+    ("08:30", "09:30"),   # London open spike
+    ("13:15", "13:45"),   # NY open spike
+]
+
+
+def _in_blackout(hhmm: str) -> bool:
+    """Check if HH:MM falls within any blackout window."""
+    for start, end in BLACKOUT_WINDOWS:
+        if start <= hhmm < end:
+            return True
+    return False
 
 
 # =============================================================================
@@ -256,6 +310,17 @@ def run_day(
     session_start_utc:  str  = "",   # "07:00" → only enter at/after this UTC time
     session_end_utc:    str  = "",   # "16:00" → only enter before this UTC time
     consec_loss_pause:  int  = 0,    # pause rest of day after N consecutive SL hits
+    # ── NEW FLAGS ────────────────────────────────────────
+    dynamic_threshold:  str  = "",   # "atr" to enable ATR-based threshold
+    atr_period:         int  = 14,
+    atr_multiplier:     float = 1.0,
+    prev_day_bars:      list[Bar] | None = None,
+    continuation_bias:  bool = False,
+    prev_day_outcome:   str  = "",   # "SL_LONG", "SL_SHORT", "TP", ""
+    time_filter:        bool = False,
+    daily_trend_align:  bool = False,
+    prev_day_start:     float = 0.0,
+    breakeven_stop:     float = 0.0,  # pips of profit to trigger BE
 ) -> DayReport:
     """
     Replay one UTC calendar day.
@@ -297,20 +362,75 @@ def run_day(
     report.start_price  = start_price
     report.lock_utc     = lock_hhmm
     report.start_source = start_source
-    levels = compute_levels(start_price, cfg)
+
+    # ── DYNAMIC THRESHOLD (FLAG 1) ──────────────────────────────────────────
+    day_cfg = cfg
+    if dynamic_threshold == "atr" and prev_day_bars:
+        dyn_thresh = compute_dynamic_threshold(
+            prev_day_bars, atr_period, atr_multiplier,
+        )
+        report.threshold_used = dyn_thresh
+        # Rebuild config with dynamic threshold: entry=1.25x, exit=2.0x
+        entry_off = dyn_thresh * cfg.entry_multiplier
+        exit_off  = dyn_thresh * cfg.exit_multiplier
+        sl_pips   = entry_off - dyn_thresh
+        tp_pips   = exit_off - entry_off
+        dyn_lot   = round(cfg.sl_dollar_target / (sl_pips * cfg.pip_value_per_lot), 2) if sl_pips > 0 else cfg.lot_size
+        day_cfg = StrategyConfig(
+            account_size             = cfg.account_size,
+            symbol                   = cfg.symbol,
+            threshold_pips           = dyn_thresh,
+            entry_multiplier         = cfg.entry_multiplier,
+            exit_multiplier          = cfg.exit_multiplier,
+            sl_dollar_target         = cfg.sl_dollar_target,
+            tp_dollar_target         = cfg.tp_dollar_target,
+            daily_profit_target_usd  = cfg.daily_profit_target_usd,
+            max_daily_loss_usd       = cfg.max_daily_loss_usd,
+            max_trades_per_day       = cfg.max_trades_per_day,
+            direction_mode           = cfg.direction_mode,
+            max_entry_overshoot_pips = cfg.max_entry_overshoot_pips,
+            session_start_hhmm       = cfg.session_start_hhmm,
+            session_end_hhmm         = cfg.session_end_hhmm,
+            force_close_hhmm         = cfg.force_close_hhmm,
+            server_utc_offset_hours  = cfg.server_utc_offset_hours,
+        )
+
+    levels = compute_levels(start_price, day_cfg)
+
+    # ── CONTINUATION BIAS (FLAG 2) ──────────────────────────────────────────
+    bias_skip: set[Direction] = set()
+    if continuation_bias and prev_day_outcome:
+        if prev_day_outcome == "SL_LONG":
+            bias_skip.add("SHORT")   # prev SL on LONG → only trade LONG today
+        elif prev_day_outcome == "SL_SHORT":
+            bias_skip.add("LONG")    # prev SL on SHORT → only trade SHORT today
+
+    # ── DAILY TREND ALIGN (FLAG 4) ──────────────────────────────────────────
+    trend_skip: set[Direction] = set()
+    if daily_trend_align and prev_day_start > 0.0:
+        if start_price > prev_day_start:
+            trend_skip.add("SHORT")  # bullish → only LONG
+        elif start_price < prev_day_start:
+            trend_skip.add("LONG")   # bearish → only SHORT
+        # equal → trade both
+
+    # ── Breakeven stop tracking (FLAG 5) ────────────────────────────────────
+    be_active = False  # whether breakeven has been triggered for current trade
+    effective_sl: float = 0.0  # overridden SL when BE triggers
+    lot = day_cfg.lot_size
 
     # ── BAR REPLAY ───────────────────────────────────────────────────────────
     for bar in bars:
-        if bar.utc_hhmm < cfg.session_start_hhmm:
+        if bar.utc_hhmm < day_cfg.session_start_hhmm:
             continue
 
         # Force close
-        if bar.utc_hhmm >= cfg.force_close_hhmm:
+        if bar.utc_hhmm >= day_cfg.force_close_hhmm:
             pending_entry = None
             if open_trade is not None:
                 ep    = bar.open
-                gross = _pnl(open_trade.direction, open_trade.entry_price, ep, cfg.lot_size)
-                sp    = _spread_cost(cfg.lot_size)
+                gross = _pnl(open_trade.direction, open_trade.entry_price, ep, lot)
+                sp    = _spread_cost(lot)
                 realized_pnl          += gross
                 open_trade.exit_price  = ep
                 open_trade.exit_bar    = bar.utc_hhmm
@@ -334,7 +454,7 @@ def run_day(
             else:
                 open_overshoot = p_entry - exec_price
 
-            if open_overshoot > cfg.max_entry_overshoot_pips:
+            if open_overshoot > day_cfg.max_entry_overshoot_pips:
                 pass  # cancelled — gap too large, do not trade
             else:
                 # Recalculate SL/TP from actual fill — direction-aware
@@ -351,7 +471,7 @@ def run_day(
 
                 snap = RiskSnapshot(realized_pnl=realized_pnl, open_pnl=0.0,
                                     trade_count=trade_count, open_position_count=0)
-                allowed, _ = can_place_trade(snap, cfg)
+                allowed, _ = can_place_trade(snap, day_cfg)
 
                 if allowed:
                     trade = TradeRecord(
@@ -363,18 +483,42 @@ def run_day(
                     already_traded.add(p_dir)
                     trade_count += 1
                     open_trade = trade
+                    be_active = False
+                    effective_sl = actual_sl
 
         # ── Step 1: resolve open position ────────────────────────────────────
         if open_trade is not None:
+            # ── Breakeven stop check (FLAG 5) ────────────────────────────
+            if breakeven_stop > 0 and not be_active:
+                if open_trade.direction == "LONG":
+                    if bar.high >= open_trade.entry_price + breakeven_stop:
+                        be_active = True
+                        effective_sl = open_trade.entry_price
+                        open_trade.be_triggered = True
+                        report.be_triggered = True
+                else:  # SHORT
+                    if bar.low <= open_trade.entry_price - breakeven_stop:
+                        be_active = True
+                        effective_sl = open_trade.entry_price
+                        open_trade.be_triggered = True
+                        report.be_triggered = True
+
+            # Use effective SL (may be moved to breakeven)
+            current_sl = effective_sl if (breakeven_stop > 0 and be_active) else open_trade.sl_price
+
             result = _check_exit_on_bar(
                 open_trade.direction, open_trade.entry_price,
-                open_trade.tp_price, open_trade.sl_price,
+                open_trade.tp_price, current_sl,
                 bar, entry_on_bar=False,
             )
             if result is not None:
                 outcome, exit_price = result
-                gross = _pnl(open_trade.direction, open_trade.entry_price, exit_price, cfg.lot_size)
-                sp    = _spread_cost(cfg.lot_size)
+                # If BE is active and SL hit, exit at entry (breakeven)
+                if be_active and outcome == "SL":
+                    exit_price = open_trade.entry_price
+                    outcome = "BE"
+                gross = _pnl(open_trade.direction, open_trade.entry_price, exit_price, lot)
+                sp    = _spread_cost(lot)
                 realized_pnl          += gross
                 open_trade.exit_price  = exit_price
                 open_trade.exit_bar    = bar.utc_hhmm
@@ -383,6 +527,7 @@ def run_day(
                 open_trade.spread_cost = sp
                 open_trade.net_pnl     = round(gross - sp, 2)
                 open_trade = None
+                be_active = False
                 # Track consecutive losses for circuit breaker
                 if outcome == "SL":
                     consec_losses += 1
@@ -390,11 +535,11 @@ def run_day(
                     consec_losses = 0
 
         # ── Step 2: daily gates ───────────────────────────────────────────────
-        if is_daily_profit_hit(realized_pnl, cfg):
+        if is_daily_profit_hit(realized_pnl, day_cfg):
             report.hit_profit = True; break
-        if is_daily_limit_breached(realized_pnl, cfg):
+        if is_daily_limit_breached(realized_pnl, day_cfg):
             report.hit_loss = True; break
-        if trade_count >= cfg.max_trades_per_day:
+        if trade_count >= day_cfg.max_trades_per_day:
             break
         if consec_loss_pause > 0 and consec_losses >= consec_loss_pause:
             report.hit_consec_pause = True; break
@@ -407,8 +552,12 @@ def run_day(
         if session_end_utc and bar.utc_hhmm >= session_end_utc:
             continue
 
-        # ── Step 3: entry signal ──────────────────────────────────────────────
-        mode = cfg.direction_mode
+        # ── Step 3b: time filter blackout (FLAG 3) ───────────────────────────
+        if time_filter and _in_blackout(bar.utc_hhmm):
+            continue
+
+        # ── Step 4: entry signal ──────────────────────────────────────────────
+        mode = day_cfg.direction_mode
         if mode == "first_only" and already_traded:
             continue
 
@@ -417,6 +566,13 @@ def run_day(
         if "SHORT" not in already_traded: dirs.append("SHORT")
 
         for direction in dirs:
+            # ── Continuation bias filter (FLAG 2) ────────────────────────
+            if direction in bias_skip:
+                continue
+            # ── Daily trend align filter (FLAG 4) ────────────────────────
+            if direction in trend_skip:
+                continue
+
             entry = levels.long_entry  if direction == "LONG"  else levels.short_entry
             tp    = levels.long_tp     if direction == "LONG"  else levels.short_tp
             sl    = levels.long_sl     if direction == "LONG"  else levels.short_sl
@@ -431,11 +587,11 @@ def run_day(
                 break
             else:
                 # Tick-touch mode
-                if not _check_entry_on_bar(direction, entry, bar, cfg.max_entry_overshoot_pips):
+                if not _check_entry_on_bar(direction, entry, bar, day_cfg.max_entry_overshoot_pips):
                     continue
                 snap = RiskSnapshot(realized_pnl=realized_pnl, open_pnl=0.0,
                                     trade_count=trade_count, open_position_count=0)
-                allowed, _ = can_place_trade(snap, cfg)
+                allowed, _ = can_place_trade(snap, day_cfg)
                 if not allowed:
                     continue
 
@@ -445,12 +601,14 @@ def run_day(
                 report.trades.append(trade)
                 already_traded.add(direction)
                 trade_count += 1
+                be_active = False
+                effective_sl = sl
 
                 result = _check_exit_on_bar(direction, entry, tp, sl, bar, entry_on_bar=True)
                 if result is not None:
                     outcome, exit_price = result
-                    gross = _pnl(direction, entry, exit_price, cfg.lot_size)
-                    sp    = _spread_cost(cfg.lot_size)
+                    gross = _pnl(direction, entry, exit_price, lot)
+                    sp    = _spread_cost(lot)
                     realized_pnl    += gross
                     trade.exit_price = exit_price
                     trade.exit_bar   = bar.utc_hhmm
@@ -468,8 +626,8 @@ def run_day(
     # EOD close
     if open_trade is not None and bars:
         ep    = bars[-1].close
-        gross = _pnl(open_trade.direction, open_trade.entry_price, ep, cfg.lot_size)
-        sp    = _spread_cost(cfg.lot_size)
+        gross = _pnl(open_trade.direction, open_trade.entry_price, ep, lot)
+        sp    = _spread_cost(lot)
         realized_pnl          += gross
         open_trade.exit_price  = ep
         open_trade.exit_bar    = "EOD"
@@ -503,6 +661,12 @@ def print_report(
     session_start_utc:  str  = "",
     session_end_utc:    str  = "",
     consec_loss_pause:  int  = 0,
+    # ── NEW FLAGS ────────────────────────────────────────
+    dynamic_threshold:  str  = "",
+    continuation_bias:  bool = False,
+    time_filter:        bool = False,
+    daily_trend_align:  bool = False,
+    breakeven_stop:     float = 0.0,
 ):
     total_gross  = sum(r.day_gross  for r in reports)
     total_spread = sum(r.day_spread for r in reports)
@@ -511,7 +675,11 @@ def print_report(
 
     all_tp = sum(1 for r in reports for t in r.trades if t.outcome == "TP")
     all_sl = sum(1 for r in reports for t in r.trades if t.outcome == "SL")
+    all_be = sum(1 for r in reports for t in r.trades if t.outcome == "BE")
     all_fc = sum(1 for r in reports for t in r.trades if t.outcome == "FORCE_CLOSE")
+    be_days = sum(1 for r in reports if r.be_triggered)
+    dyn_thresholds = [r.threshold_used for r in reports if r.threshold_used > 0]
+    avg_dyn_thresh = sum(dyn_thresholds) / len(dyn_thresholds) if dyn_thresholds else 0.0
 
     win_days      = [r for r in reports if r.day_net > 0]
     loss_days     = [r for r in reports if r.day_net < 0]
@@ -536,6 +704,16 @@ def print_report(
         entry_mode += f"+SESSION({sess})"
     if consec_loss_pause:
         entry_mode += f"+CONSEC-PAUSE({consec_loss_pause})"
+    if dynamic_threshold:
+        entry_mode += f"+DYN-THRESH({dynamic_threshold.upper()})"
+    if continuation_bias:
+        entry_mode += "+CONT-BIAS"
+    if time_filter:
+        entry_mode += "+TIME-FILTER"
+    if daily_trend_align:
+        entry_mode += "+DAILY-TREND-ALIGN"
+    if breakeven_stop > 0:
+        entry_mode += f"+BE-STOP({breakeven_stop:.0f}pip)"
     start_mode = f"day_files({day_file_days}d)+bar_open_fallback" if data_dir else "bar_open(fallback only)"
 
     print(f"\n╔{sep}╗")
@@ -552,11 +730,14 @@ def print_report(
 
     for r in reports:
         src_tag = "📂" if r.start_source == "day_file" else "📊"
+        dyn_tag = f"  T={r.threshold_used:.1f}" if r.threshold_used > 0 else ""
+        be_day_tag = "  BE" if r.be_triggered else ""
         if r.no_trigger:
-            print(f"║  {r.date}  {src_tag}S={r.start_price:<10.3f}  lock@{r.lock_utc}  No signal triggered".ljust(W+1) + "║")
+            print(f"║  {r.date}  {src_tag}S={r.start_price:<10.3f}  lock@{r.lock_utc}{dyn_tag}  No signal triggered".ljust(W+1) + "║")
             continue
         for i, t in enumerate(r.trades):
-            sym  = "✅" if t.outcome == "TP" else "❌" if t.outcome == "SL" else "⚠️ "
+            sym  = "✅" if t.outcome == "TP" else "❌" if t.outcome == "SL" else "🔄" if t.outcome == "BE" else "⚠️ "
+            be_tag = " BE" if t.be_triggered else ""
             stop = (" 🎯PROFIT" if (r.hit_profit and i == len(r.trades)-1)
                     else " ⛔LOSS"   if (r.hit_loss   and i == len(r.trades)-1) else "")
             net_s = f"+${t.net_pnl:,.0f}" if t.net_pnl >= 0 else f"-${abs(t.net_pnl):,.0f}"
@@ -564,11 +745,12 @@ def print_report(
             lock_s = f"lock@{r.lock_utc}" if i == 0 else " " * 9
             date_s = r.date if i == 0 else " " * 10
             src_s  = src_tag if i == 0 else "  "
+            dyn_s  = dyn_tag if i == 0 else ""
             print(
-                f"║  {date_s}  {src_s}S={r.start_price:<9.3f}  {lock_s}  "
+                f"║  {date_s}  {src_s}S={r.start_price:<9.3f}  {lock_s}{dyn_s}  "
                 f"{t.direction:<5}  {t.entry_bar}  "
                 f"@{t.entry_price:.3f}→{t.exit_price:.3f}  "
-                f"{sym}{t.outcome:<11}  {grs_s}  net={net_s}{stop}".ljust(W+1) + "║"
+                f"{sym}{t.outcome:<11}{be_tag}  {grs_s}  net={net_s}{stop}".ljust(W+1) + "║"
             )
         day_s = f"+${r.day_net:,.0f}" if r.day_net >= 0 else f"-${abs(r.day_net):,.0f}"
         print(f"║{'':>12}  DAY → gross={r.day_gross:+,.0f}  spread=-${r.day_spread:,.0f}  net={day_s}".ljust(W+1) + "║")
@@ -592,7 +774,13 @@ def print_report(
     print(kv("Total trades:", total_trades))
     print(kv("TP hits:", f"{all_tp}  ({win_rate:.1f}% win rate)"))
     print(kv("SL hits:", all_sl))
+    if all_be:
+        print(kv("BE (breakeven) exits:", all_be))
     print(kv("Force closed:", all_fc))
+    if be_days:
+        print(kv("BE triggered days:", f"{be_days} of {active_days} active"))
+    if dyn_thresholds:
+        print(kv("Avg dynamic threshold:", f"{avg_dyn_thresh:.1f} pips ({len(dyn_thresholds)} days)"))
     print(f"║{thn}║")
     print(kv("Gross P&L:", f"${total_gross:+,.2f}"))
     print(kv("Spread cost:", f"-${total_spread:,.2f}"))
@@ -609,6 +797,23 @@ def print_report(
     print(kv("Projected 22-day month:", f"${proj_22:+,.2f}"))
     print(kv("Projected annual:", f"${proj_yr:+,.2f}"))
     print(kv("Projected annual ROI:", f"{proj_roi:.1f}%"))
+
+    # ── Flags comparison section ─────────────────────────────────────────────
+    active_flags = []
+    if dynamic_threshold:  active_flags.append(f"dynamic-threshold={dynamic_threshold}")
+    if continuation_bias:  active_flags.append("continuation-bias")
+    if time_filter:        active_flags.append("time-filter")
+    if daily_trend_align:  active_flags.append("daily-trend-align")
+    if breakeven_stop > 0: active_flags.append(f"breakeven-stop={breakeven_stop:.0f}")
+
+    if len(active_flags) > 1:
+        print(f"╠{sep}╣")
+        print(f"║{'ACTIVE FLAGS COMBINATION':^{W}}║")
+        print(f"╠{sep}╣")
+        for flag in active_flags:
+            print(kv(f"  {flag}:", "ON"))
+        print(kv("Combined effect:", f"{total_trades} trades, {win_rate:.1f}% WR, ${total_net:+,.2f} net"))
+
     print(f"╚{sep}╝")
     print()
     print(f"[INFO] Entry: {entry_mode}")
@@ -717,6 +922,23 @@ Examples:
     p.add_argument("--force-close",   type=str,   default="23:30")
     p.add_argument("--overshoot",     type=float, default=3.0)
     p.add_argument("--verbose",       action="store_true")
+
+    # ── NEW FLAGS ────────────────────────────────────────────────────────────
+    p.add_argument("--dynamic-threshold", type=str, default="", choices=["", "atr"],
+                   help="Dynamic threshold mode. 'atr' = ATR-based from prev day M5 bars.")
+    p.add_argument("--atr-period",   type=int,   default=14,
+                   help="ATR lookback period in bars (default 14).")
+    p.add_argument("--atr-multiplier", type=float, default=1.0,
+                   help="ATR multiplier for threshold (default 1.0). Result clamped 10-50 pips.")
+    p.add_argument("--continuation-bias", action="store_true",
+                   help="After prev day SL on LONG → only LONG today. SL SHORT → only SHORT.")
+    p.add_argument("--time-filter",  action="store_true",
+                   help="Skip entries during blackout windows: 00-01, 08:30-09:30, 13:15-13:45 UTC.")
+    p.add_argument("--daily-trend-align", action="store_true",
+                   help="Only LONG if today start > yesterday start. SHORT if below.")
+    p.add_argument("--breakeven-stop", type=float, default=0.0,
+                   help="Move SL to entry after N pips profit (e.g. --breakeven-stop 8).")
+
     return p.parse_args()
 
 
@@ -741,35 +963,72 @@ def main():
         sys.exit(1)
 
     day_map = group_by_day(bars)
+    dates = list(day_map.keys())
     print(f"[BACKTEST] {len(day_map)} UTC trading days\n")
 
     reports: list[DayReport] = []
-    for date, day_bars in day_map.items():
+    prev_day_outcome: str = ""
+    prev_day_start: float = 0.0
+    prev_day_bars_cache: list[Bar] | None = None
+
+    for idx, date in enumerate(dates):
+        day_bars = day_map[date]
         if args.verbose:
             fb = day_bars[0]
             print(f"[BACKTEST] {date}  bars={len(day_bars)}  first={fb.utc_hhmm}  open={fb.open:.3f}")
         sess_start = "07:00" if args.session_london_ny else ""
         sess_end   = "16:00" if args.session_london_ny else ""
-        reports.append(run_day(
+
+        report = run_day(
             date, day_bars, cfg,
-            close_confirm     = args.close_confirm,
-            trend_filter      = args.trend_filter,
-            data_dir          = args.data_dir,
-            session_start_utc = sess_start,
-            session_end_utc   = sess_end,
-            consec_loss_pause = args.consec_loss_pause,
-        ))
+            close_confirm      = args.close_confirm,
+            trend_filter       = args.trend_filter,
+            data_dir           = args.data_dir,
+            session_start_utc  = sess_start,
+            session_end_utc    = sess_end,
+            consec_loss_pause  = args.consec_loss_pause,
+            # ── NEW FLAGS ────────────────────────────────────
+            dynamic_threshold  = args.dynamic_threshold,
+            atr_period         = args.atr_period,
+            atr_multiplier     = args.atr_multiplier,
+            prev_day_bars      = prev_day_bars_cache,
+            continuation_bias  = args.continuation_bias,
+            prev_day_outcome   = prev_day_outcome,
+            time_filter        = args.time_filter,
+            daily_trend_align  = args.daily_trend_align,
+            prev_day_start     = prev_day_start,
+            breakeven_stop     = args.breakeven_stop,
+        )
+        reports.append(report)
+
+        # ── Track prev day state for next iteration ──────────────────────
+        prev_day_bars_cache = day_bars
+        prev_day_start = report.start_price
+
+        # Determine prev_day_outcome for continuation bias
+        prev_day_outcome = ""
+        if report.trades:
+            last_trade = report.trades[-1]
+            if last_trade.outcome == "SL":
+                prev_day_outcome = f"SL_{last_trade.direction}"
+            elif last_trade.outcome == "TP":
+                prev_day_outcome = "TP"
 
     sess_start = "07:00" if args.session_london_ny else ""
     sess_end   = "16:00" if args.session_london_ny else ""
     print_report(
         reports, cfg, args.months, args.symbol,
-        close_confirm     = args.close_confirm,
-        trend_filter      = args.trend_filter,
-        data_dir          = args.data_dir,
-        session_start_utc = sess_start,
-        session_end_utc   = sess_end,
-        consec_loss_pause = args.consec_loss_pause,
+        close_confirm      = args.close_confirm,
+        trend_filter       = args.trend_filter,
+        data_dir           = args.data_dir,
+        session_start_utc  = sess_start,
+        session_end_utc    = sess_end,
+        consec_loss_pause  = args.consec_loss_pause,
+        dynamic_threshold  = args.dynamic_threshold,
+        continuation_bias  = args.continuation_bias,
+        time_filter        = args.time_filter,
+        daily_trend_align  = args.daily_trend_align,
+        breakeven_stop     = args.breakeven_stop,
     )
 
 
