@@ -50,6 +50,15 @@ def is_news_blackout(
     return False
 
 
+def is_news_blackout_day(
+    strategy_cfg: StrategyConfig = cfg,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Returns True if today is in the news_blackout_dates list."""
+    today = _utc_now(now_utc).strftime("%Y-%m-%d")
+    return today in (strategy_cfg.news_blackout_dates or [])
+
+
 def session_status(
     strategy_cfg: StrategyConfig = cfg,
     now_utc: datetime | None = None,

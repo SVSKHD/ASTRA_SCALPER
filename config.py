@@ -28,7 +28,7 @@ from __future__ import annotations
 #   lock_hhmm_mt5 = "00:00" UTC — server UTC+3 is display only
 # =============================================================================
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -60,6 +60,11 @@ class StrategyConfig:
 
     # ── ENTRY OVERSHOOT FILTER ────────────────────────────
     max_entry_overshoot_pips: float = 3.0
+
+    # ── NEWS BLACKOUT DAYS ────────────────────────────────
+    # List of "YYYY-MM-DD" UTC dates to skip trading entirely
+    # e.g. ["2026-04-02", "2026-04-03"] for NFP / FOMC days
+    news_blackout_dates: list = field(default_factory=list)
 
     # ── SESSION FILTER (all UTC) ──────────────────────────
     session_start_hhmm:    str = "00:00"
