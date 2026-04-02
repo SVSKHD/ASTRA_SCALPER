@@ -40,6 +40,44 @@ log = logging.getLogger("runner")
 # IST = UTC + 5:30
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+_MAX_CLOSE_RETRIES = 3
+
+
+def _tg_safe(fn, *args, **kwargs):
+    """Call a Telegram notify function; swallow all exceptions."""
+    if not TELEGRAM:
+        return
+    try:
+        fn(*args, **kwargs)
+    except Exception as e:
+        print(f"[Telegram] Send failed: {repr(e)}")
+
+
+def _lookup_deal_pnl(ticket: int) -> float | None:
+    """
+    Look up exact closed P&L from MT5 deal history for today.
+    Uses history_deals_get(day_start, now) filtered by magic + symbol,
+    then matches deal.position_id == ticket.
+    Returns the profit from the closing deal, or None if not yet in history.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(day_start, now)
+        if not deals:
+            return None
+        pos_deals = [
+            d for d in deals
+            if d.magic == cfg.magic_number
+            and d.symbol == cfg.symbol
+            and d.position_id == ticket
+        ]
+        if not pos_deals:
+            return None
+        return sum(d.profit for d in pos_deals)
+    except Exception:
+        return None
+
 
 class DayState:
     def __init__(self):
@@ -53,6 +91,12 @@ class DayState:
         self._tracked_positions: list[dict]         = []
         # BUG 3 FIX: prevent double-firing within same poll cycle
         self.order_in_flight: bool                  = False
+        # Telegram: each notification key fires exactly once per UTC day
+        # Keys: "day_start", "loss_limit", "profit_target",
+        #       "tp_{ticket}", "sl_{ticket}", "fc_{ticket}"
+        self.notified_today:  set[str]              = set()
+        # Deal history retry tracking: ticket → retry count
+        self._close_retry_count: dict[int, int]     = {}
 
     def reset(self, date: str):
         self.date           = date
@@ -63,6 +107,8 @@ class DayState:
         self.internal_pnl   = 0.0
         self._tracked_positions = []
         self.order_in_flight = False
+        self.notified_today = set()
+        self._close_retry_count = {}
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
     def track_position(self, ticket: int, fill_price: float,
@@ -78,43 +124,81 @@ class DayState:
             "tp_price": tp_price,
         })
 
-    def update_closed_positions(self):
+    def update_closed_positions(self) -> list[dict]:
         """
         Check tracked positions against MT5 open positions.
-        If a tracked position is no longer open, calculate its P&L
-        from the current tick and add to internal_pnl.
+        If a tracked position is no longer open, read exact P&L from
+        MT5 deal history (filtered by magic + symbol + position_id).
+        Falls back to tick estimate after _MAX_CLOSE_RETRIES poll cycles.
+
+        Returns list of dicts for each confirmed closed position:
+          {"ticket", "direction", "fill_price", "sl_price", "tp_price", "pnl"}
         """
         if not self._tracked_positions:
-            return
+            return []
 
         open_tickets = {p.ticket for p in get_open_positions(cfg)}
         still_open = []
+        closed = []
 
         for pos in self._tracked_positions:
             if pos["ticket"] in open_tickets:
                 still_open.append(pos)
                 continue
 
-            # Position closed — estimate P&L from current price
-            tick = mt5.symbol_info_tick(cfg.symbol)
-            if tick is not None:
-                if pos["direction"] == "LONG":
-                    close_est = float(tick.bid)
-                    pnl = (close_est - pos["fill_price"]) * pos["volume"] * cfg.pip_value_per_lot
+            ticket = pos["ticket"]
+
+            # Try exact P&L from MT5 deal history
+            pnl = _lookup_deal_pnl(ticket)
+
+            if pnl is None:
+                # Deal not yet in history — retry or fall back to estimate
+                retries = self._close_retry_count.get(ticket, 0)
+                if retries < _MAX_CLOSE_RETRIES:
+                    self._close_retry_count[ticket] = retries + 1
+                    log.info(
+                        f"[{cfg.symbol}] Position #{ticket} closed but deal not in history "
+                        f"(retry {retries + 1}/{_MAX_CLOSE_RETRIES})"
+                    )
+                    # Keep in tracked list — will retry next poll cycle
+                    still_open.append(pos)
+                    continue
+
+                # Max retries exhausted — fall back to tick estimate
+                log.warning(
+                    f"[{cfg.symbol}] Position #{ticket} deal history unavailable after "
+                    f"{_MAX_CLOSE_RETRIES} retries — using tick estimate"
+                )
+                tick = mt5.symbol_info_tick(cfg.symbol)
+                if tick is not None:
+                    if pos["direction"] == "LONG":
+                        close_est = float(tick.bid)
+                        pnl = (close_est - pos["fill_price"]) * pos["volume"] * cfg.pip_value_per_lot
+                    else:
+                        close_est = float(tick.ask)
+                        pnl = (pos["fill_price"] - close_est) * pos["volume"] * cfg.pip_value_per_lot
                 else:
-                    close_est = float(tick.ask)
-                    pnl = (pos["fill_price"] - close_est) * pos["volume"] * cfg.pip_value_per_lot
-            else:
-                # No tick available — assume worst case (SL hit)
-                pnl = -cfg.sl_dollar
+                    pnl = -cfg.sl_dollar
+
+            # Clean up retry counter
+            self._close_retry_count.pop(ticket, None)
 
             self.internal_pnl += pnl
             log.info(
-                f"[{cfg.symbol}] Position #{pos['ticket']} closed | "
-                f"internal_pnl update: {pnl:+.2f} → total: {self.internal_pnl:+.2f}"
+                f"[{cfg.symbol}] Position #{ticket} closed | "
+                f"pnl: {pnl:+.2f} | internal_pnl total: {self.internal_pnl:+.2f}"
             )
+            closed.append({
+                "ticket": ticket,
+                "direction": pos["direction"],
+                "fill_price": pos["fill_price"],
+                "sl_price": pos["sl_price"],
+                "tp_price": pos["tp_price"],
+                "pnl": pnl,
+            })
 
         self._tracked_positions = still_open
+        return closed
 
 
 def _today() -> str:
@@ -144,7 +228,7 @@ def _snapshot(trade_count: int, internal_pnl: float) -> RiskSnapshot:
     effective_pnl = min(mt5_pnl, internal_pnl) if internal_pnl < 0 else mt5_pnl
     if internal_pnl < mt5_pnl:
         log.warning(
-            f"[{cfg.symbol}] ⚠️ INTERNAL P&L ({internal_pnl:+.2f}) worse than "
+            f"[{cfg.symbol}] INTERNAL P&L ({internal_pnl:+.2f}) worse than "
             f"MT5 history ({mt5_pnl:+.2f}) — using internal value"
         )
     return RiskSnapshot(
@@ -156,10 +240,27 @@ def _snapshot(trade_count: int, internal_pnl: float) -> RiskSnapshot:
 
 
 def _force_close(state: DayState):
-    print(f"[{cfg.symbol}] 🔴 FORCE CLOSE — EOD")
-    for r in close_all_by_magic(cfg):
-        print(f"  {'✅' if r['success'] else '❌'} ticket={r['ticket']} retcode={r['retcode']}")
+    print(f"[{cfg.symbol}] FORCE CLOSE — EOD")
+    results = close_all_by_magic(cfg)
+    for r in results:
+        print(f"  {'OK' if r['success'] else 'FAIL'} ticket={r['ticket']} retcode={r['retcode']}")
     pnl = calculate_day_pnl(cfg)
+
+    # Telegram: notify each force-closed position (with dedup)
+    for r in results:
+        fc_key = f"fc_{r['ticket']}"
+        if TELEGRAM and fc_key not in state.notified_today:
+            # Look up fill_price from tracked positions if available
+            fill = 0.0
+            for pos in state._tracked_positions:
+                if pos["ticket"] == r["ticket"]:
+                    fill = pos["fill_price"]
+                    break
+            tick = mt5.symbol_info_tick(cfg.symbol)
+            close_price = float(tick.bid) if tick else 0.0
+            _tg_safe(notify_force_close, cfg.symbol, fill, close_price, pnl)
+            state.notified_today.add(fc_key)
+
     print(
         f"\n[{cfg.symbol}] ── END OF DAY ─────────────────────\n"
         f"  UTC Date   : {state.date}\n"
@@ -167,8 +268,9 @@ def _force_close(state: DayState):
         f"  Realized   : ${pnl:+.2f}\n"
         f"───────────────────────────────────────\n"
     )
-    if TELEGRAM:
-        notify_day_end(cfg.symbol, state.date, state.trade_count, pnl)
+
+    # Telegram: end-of-day summary
+    _tg_safe(notify_day_end, cfg.symbol, state.date, state.trade_count, pnl)
 
 
 def _handle_signal(signal: Signal, state: DayState) -> bool:
@@ -181,12 +283,12 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             overshoot = signal.entry_price - fill_price_est
         if overshoot > cfg.max_entry_overshoot_pips:
             log.warning(
-                f"[{cfg.symbol}] ⚠️ OVERSHOOT BLOCKED | {signal.direction} | "
+                f"[{cfg.symbol}] OVERSHOOT BLOCKED | {signal.direction} | "
                 f"fill_est={fill_price_est:.2f} | entry={signal.entry_price:.2f} | "
                 f"overshoot={overshoot:.2f} pips > max={cfg.max_entry_overshoot_pips:.1f}"
             )
             print(
-                f"[{cfg.symbol}] ⚠️ OVERSHOOT BLOCKED | {signal.direction} | "
+                f"[{cfg.symbol}] OVERSHOOT BLOCKED | {signal.direction} | "
                 f"overshoot={overshoot:.2f} pips > max {cfg.max_entry_overshoot_pips:.1f} pips"
             )
             return False
@@ -195,10 +297,10 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
     allowed, reason = can_place_trade(snap, cfg)
 
     if not allowed:
-        print(f"[{cfg.symbol}] 🚫 BLOCKED | {reason}")
+        print(f"[{cfg.symbol}] BLOCKED | {reason}")
         return False
 
-    print(f"\n[{cfg.symbol}] 🎯 {signal}")
+    print(f"\n[{cfg.symbol}] {signal}")
     print(loss_scenario_summary(snap.realized_pnl, cfg))
 
     # BUG 3 FIX: set order_in_flight before place_order
@@ -225,7 +327,7 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
         post   = calculate_day_pnl(cfg)
         budget = cfg.max_daily_loss_usd - abs(min(post, 0))
         print(
-            f"[{cfg.symbol}] ✅ Trade #{state.trade_count} PLACED\n"
+            f"[{cfg.symbol}] Trade #{state.trade_count} PLACED\n"
             f"  Direction  : {signal.direction}\n"
             f"  Fill       : {actual_fill}\n"
             f"  TP         : {signal.tp_price:.2f}\n"
@@ -234,9 +336,17 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             f"  Budget left: ${budget:.0f}\n"
             f"  Profit tgt : +${cfg.daily_profit_target_usd:.0f}"
         )
+
+        # Telegram: trade placed
+        _tg_safe(
+            notify_trade_placed,
+            cfg.symbol, signal.direction, actual_fill,
+            signal.sl_price, signal.tp_price,
+            cfg.lot_size, cfg.sl_dollar, cfg.tp_dollar,
+        )
         return True
 
-    print(f"[{cfg.symbol}] ❌ ORDER FAILED | retcode={result.get('retcode')} | {result.get('comment')}")
+    print(f"[{cfg.symbol}] ORDER FAILED | retcode={result.get('retcode')} | {result.get('comment')}")
     return False
 
 
@@ -264,7 +374,7 @@ def run():
     last_log_ts  = 0.0
     last_warn_ts = 0.0
 
-    print(f"[{cfg.symbol}] ⏳ Waiting for start price...")
+    print(f"[{cfg.symbol}] Waiting for start price...")
     print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
 
     while True:
@@ -284,15 +394,19 @@ def run():
                     continue
                 state.start_price = price
                 state.levels      = compute_levels(price, cfg)
-                print(state.levels.display())
-                if TELEGRAM:
+                _print_day_levels(state.levels)
+
+                # Telegram: day start notification (once per day)
+                if TELEGRAM and "day_start" not in state.notified_today:
                     lv = state.levels
-                    notify_day_start(
+                    _tg_safe(
+                        notify_day_start,
                         cfg.symbol, price,
-                        lv.long_entry,  lv.long_tp,  lv.long_sl,
+                        lv.long_entry, lv.long_tp, lv.long_sl,
                         lv.short_entry, lv.short_tp, lv.short_sl,
                         cfg.lot_size,
                     )
+                    state.notified_today.add("day_start")
 
             # ── FORCE CLOSE ──────────────────────────────────────────────────
             if is_force_close_time(cfg) and not force_closed:
@@ -311,7 +425,38 @@ def run():
                 continue
 
             # ── BUG 2 FIX: update internal P&L from closed positions ────────
-            state.update_closed_positions()
+            closed_positions = state.update_closed_positions()
+
+            # Telegram: notify TP/SL for each closed position (with dedup)
+            for cp in closed_positions:
+                ticket = cp["ticket"]
+                pnl = cp["pnl"]
+                if pnl > 0:
+                    tp_key = f"tp_{ticket}"
+                    if TELEGRAM and tp_key not in state.notified_today:
+                        _tg_safe(
+                            notify_tp,
+                            cfg.symbol, cp["direction"], cp["fill_price"],
+                            cp["tp_price"], pnl,
+                        )
+                        state.notified_today.add(tp_key)
+                elif pnl < 0:
+                    sl_key = f"sl_{ticket}"
+                    if TELEGRAM and sl_key not in state.notified_today:
+                        _tg_safe(
+                            notify_sl,
+                            cfg.symbol, cp["direction"], cp["fill_price"],
+                            cp["sl_price"], pnl,
+                        )
+                        state.notified_today.add(sl_key)
+                else:
+                    fc_key = f"fc_{ticket}"
+                    if TELEGRAM and fc_key not in state.notified_today:
+                        _tg_safe(
+                            notify_force_close,
+                            cfg.symbol, cp["fill_price"], cp["fill_price"], 0.0,
+                        )
+                        state.notified_today.add(fc_key)
 
             # Use worse of MT5 history and internal tracking for P&L checks
             mt5_realized = calculate_day_pnl(cfg)
@@ -322,11 +467,14 @@ def run():
                 now = time.time()
                 if now - last_warn_ts >= 60.0:
                     print(
-                        f"[{cfg.symbol}] 🎯 PROFIT TARGET HIT | "
+                        f"[{cfg.symbol}] PROFIT TARGET HIT | "
                         f"PnL=${realized:+.2f} | target=+${cfg.daily_profit_target_usd:.0f}"
                     )
                     last_warn_ts = now
-                    if TELEGRAM: notify_profit_target(cfg.symbol, realized)
+                # Telegram: one-time profit target notification
+                if TELEGRAM and "profit_target" not in state.notified_today:
+                    _tg_safe(notify_profit_target, cfg.symbol, realized)
+                    state.notified_today.add("profit_target")
                 time.sleep(10.0)
                 continue
 
@@ -336,16 +484,19 @@ def run():
                 if now - last_warn_ts >= 60.0:
                     src = "internal" if state.internal_pnl < mt5_realized else "MT5"
                     print(
-                        f"[{cfg.symbol}] ⛔ LOSS LIMIT BREACHED ({src}) | "
+                        f"[{cfg.symbol}] LOSS LIMIT BREACHED ({src}) | "
                         f"PnL=${realized:+.2f} | limit=-${cfg.max_daily_loss_usd:.0f}"
                     )
                     if state.internal_pnl < mt5_realized:
                         log.warning(
-                            f"[{cfg.symbol}] ⚠️ Internal P&L ({state.internal_pnl:+.2f}) "
+                            f"[{cfg.symbol}] Internal P&L ({state.internal_pnl:+.2f}) "
                             f"breached limit before MT5 history ({mt5_realized:+.2f}) caught up"
                         )
                     last_warn_ts = now
-                    if TELEGRAM: notify_loss_limit(cfg.symbol, realized)
+                # Telegram: one-time loss limit notification
+                if TELEGRAM and "loss_limit" not in state.notified_today:
+                    _tg_safe(notify_loss_limit, cfg.symbol, realized)
+                    state.notified_today.add("loss_limit")
                 time.sleep(10.0)
                 continue
 
@@ -387,11 +538,11 @@ def run():
             time.sleep(cfg.poll_seconds)
 
         except KeyboardInterrupt:
-            print(f"\n[{cfg.symbol}] 🛑 Stopped manually.")
+            print(f"\n[{cfg.symbol}] Stopped manually.")
             close_all_by_magic(cfg)
             break
         except Exception as e:
-            print(f"[{cfg.symbol}] ⚠️ Error: {repr(e)}")
+            print(f"[{cfg.symbol}] Error: {repr(e)}")
             state.order_in_flight = False  # Reset on error to avoid permanent lock
             time.sleep(2.0)
 
