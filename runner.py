@@ -25,6 +25,15 @@ from executor import (
     place_order, close_all_by_magic,
     calculate_day_pnl, calculate_open_pnl, get_open_positions,
 )
+try:
+    from telegram_notify import (
+        notify_day_start, notify_trade_placed,
+        notify_tp, notify_sl, notify_force_close,
+        notify_day_end, notify_loss_limit, notify_profit_target,
+    )
+    TELEGRAM = True
+except Exception:
+    TELEGRAM = False
 
 log = logging.getLogger("runner")
 
@@ -158,6 +167,8 @@ def _force_close(state: DayState):
         f"  Realized   : ${pnl:+.2f}\n"
         f"───────────────────────────────────────\n"
     )
+    if TELEGRAM:
+        notify_day_end(cfg.symbol, state.date, state.trade_count, pnl)
 
 
 def _handle_signal(signal: Signal, state: DayState) -> bool:
@@ -273,7 +284,15 @@ def run():
                     continue
                 state.start_price = price
                 state.levels      = compute_levels(price, cfg)
-                _print_day_levels(state.levels)
+                print(state.levels.display())
+                if TELEGRAM:
+                    lv = state.levels
+                    notify_day_start(
+                        cfg.symbol, price,
+                        lv.long_entry,  lv.long_tp,  lv.long_sl,
+                        lv.short_entry, lv.short_tp, lv.short_sl,
+                        cfg.lot_size,
+                    )
 
             # ── FORCE CLOSE ──────────────────────────────────────────────────
             if is_force_close_time(cfg) and not force_closed:
@@ -307,6 +326,7 @@ def run():
                         f"PnL=${realized:+.2f} | target=+${cfg.daily_profit_target_usd:.0f}"
                     )
                     last_warn_ts = now
+                    if TELEGRAM: notify_profit_target(cfg.symbol, realized)
                 time.sleep(10.0)
                 continue
 
@@ -325,6 +345,7 @@ def run():
                             f"breached limit before MT5 history ({mt5_realized:+.2f}) caught up"
                         )
                     last_warn_ts = now
+                    if TELEGRAM: notify_loss_limit(cfg.symbol, realized)
                 time.sleep(10.0)
                 continue
 

@@ -4,11 +4,11 @@ from __future__ import annotations
 # THRESHOLD LEVELS — pure math, no MT5, no I/O
 # All offsets derived from config. Never hardcoded.
 #
-# For start price S:
-#   long_breakout = S + 20   (1.0× — do not enter)
-#   long_entry    = S + 22   (1.1× — trigger)
-#   long_tp       = S + 24   (1.2× — true threshold exit)
-#   long_sl       = S + 20   (back at 1.0× breakout)
+# For start price S (active config: entry_mult=1.25, exit_mult=2.0):
+#   long_breakout = S + 20   (1.0× — SL anchor)
+#   long_entry    = S + 25   (1.25× — trigger, 5 pips above breakout)
+#   long_tp       = S + 40   (2.0×  — take profit, 15 pips above entry)
+#   long_sl       = S + 20   (back at breakout, 5 pips below entry)
 # =============================================================================
 
 from dataclasses import dataclass
@@ -21,8 +21,8 @@ class ThresholdLevels:
 
     # Long
     long_breakout: float     # 1.0× — confirmation, not entry
-    long_entry:    float     # 1.1× — entry trigger
-    long_tp:       float     # 1.2× — take profit
+    long_entry:    float     # entry_multiplier× — entry trigger
+    long_tp:       float     # exit_multiplier×  — take profit
     long_sl:       float     # 1.0× — stop loss (same as breakout)
 
     # Short
@@ -32,23 +32,25 @@ class ThresholdLevels:
     short_sl:       float
 
     def display(self) -> str:
+        from config import cfg as _cfg
+        c = _cfg
         return (
             f"\n{'─'*50}\n"
             f"  START PRICE      : {self.start:.2f}\n"
             f"{'─'*50}\n"
             f"  LONG\n"
-            f"    Breakout (1.0×): {self.long_breakout:.2f}   ← do not enter\n"
-            f"    Entry    (1.1×): {self.long_entry:.2f}   ← trigger\n"
-            f"    Exit     (1.2×): {self.long_tp:.2f}   ← take profit\n"
-            f"    Stop Loss      : {self.long_sl:.2f}   ← back at breakout\n"
-            f"    Capture        : ${self.long_tp - self.long_entry:.2f} per pip per lot\n"
+            f"    Breakout (1.0×)  : {self.long_breakout:.2f}   ← SL anchor\n"
+            f"    Entry  ({c.entry_multiplier}×) : {self.long_entry:.2f}   ← trigger (+{c.entry_offset:.0f} pips)\n"
+            f"    TP     ({c.exit_multiplier}×)  : {self.long_tp:.2f}   ← take profit (+{c.exit_offset:.0f} pips)\n"
+            f"    SL              : {self.long_sl:.2f}   ← {c.sl_pips:.0f} pips below entry\n"
+            f"    Risk / Reward   : ${c.sl_dollar:.0f} SL  /  ${c.tp_dollar:.0f} TP  | lot={c.lot_size}\n"
             f"{'─'*50}\n"
             f"  SHORT\n"
-            f"    Breakout (1.0×): {self.short_breakout:.2f}   ← do not enter\n"
-            f"    Entry    (1.1×): {self.short_entry:.2f}   ← trigger\n"
-            f"    Exit     (1.2×): {self.short_tp:.2f}   ← take profit\n"
-            f"    Stop Loss      : {self.short_sl:.2f}   ← back at breakout\n"
-            f"    Capture        : ${self.short_entry - self.short_tp:.2f} per pip per lot\n"
+            f"    Breakout (1.0×)  : {self.short_breakout:.2f}   ← SL anchor\n"
+            f"    Entry  ({c.entry_multiplier}×) : {self.short_entry:.2f}   ← trigger (-{c.entry_offset:.0f} pips)\n"
+            f"    TP     ({c.exit_multiplier}×)  : {self.short_tp:.2f}   ← take profit (-{c.exit_offset:.0f} pips)\n"
+            f"    SL              : {self.short_sl:.2f}   ← {c.sl_pips:.0f} pips above entry\n"
+            f"    Risk / Reward   : ${c.sl_dollar:.0f} SL  /  ${c.tp_dollar:.0f} TP  | lot={c.lot_size}\n"
             f"{'─'*50}\n"
         )
 
@@ -59,12 +61,12 @@ def compute_levels(
 ) -> ThresholdLevels:
     """
     Compute all threshold price levels from the locked start price.
-    Uses entry_offset (1.1×) and exit_offset (1.2×) from config.
+    Uses entry_offset (1.25× = S±25) and exit_offset (2.0× = S±40) from config.
     """
     s  = start_price
-    b  = strategy_cfg.breakout_offset   # 20.0
-    e  = strategy_cfg.entry_offset      # 22.0
-    x  = strategy_cfg.exit_offset       # 24.0
+    b  = strategy_cfg.breakout_offset   # 20.0 (1.0×)
+    e  = strategy_cfg.entry_offset      # 25.0 (1.25×)
+    x  = strategy_cfg.exit_offset       # 40.0 (2.0×)
 
     return ThresholdLevels(
         start=s,

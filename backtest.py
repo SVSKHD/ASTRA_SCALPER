@@ -87,17 +87,18 @@ class TradeRecord:
 
 @dataclass
 class DayReport:
-    date:         str
-    start_price:  float
-    lock_utc:     str  = ""
-    start_source: str  = ""   # "day_file" | "bar_open"
-    trades:       list[TradeRecord] = field(default_factory=list)
-    day_gross:    float = 0.0
-    day_net:      float = 0.0
-    day_spread:   float = 0.0
-    hit_profit:   bool  = False
-    hit_loss:     bool  = False
-    no_trigger:   bool  = False
+    date:             str
+    start_price:      float
+    lock_utc:         str  = ""
+    start_source:     str  = ""   # "day_file" | "bar_open"
+    trades:           list[TradeRecord] = field(default_factory=list)
+    day_gross:        float = 0.0
+    day_net:          float = 0.0
+    day_spread:       float = 0.0
+    hit_profit:       bool  = False
+    hit_loss:         bool  = False
+    hit_consec_pause: bool  = False
+    no_trigger:       bool  = False
 
 
 # =============================================================================
@@ -246,12 +247,15 @@ def _trend_filter_ok(direction: Direction, bar: Bar, start_price: float) -> bool
 # =============================================================================
 
 def run_day(
-    date:          str,
-    bars:          list[Bar],
-    cfg:           StrategyConfig,
-    close_confirm: bool = False,
-    trend_filter:  bool = False,
-    data_dir:      str  = "",   # path to data/ folder for day files
+    date:               str,
+    bars:               list[Bar],
+    cfg:                StrategyConfig,
+    close_confirm:      bool = False,
+    trend_filter:       bool = False,
+    data_dir:           str  = "",
+    session_start_utc:  str  = "",   # "07:00" → only enter at/after this UTC time
+    session_end_utc:    str  = "",   # "16:00" → only enter before this UTC time
+    consec_loss_pause:  int  = 0,    # pause rest of day after N consecutive SL hits
 ) -> DayReport:
     """
     Replay one UTC calendar day.
@@ -266,6 +270,7 @@ def run_day(
     realized_pnl    = 0.0
     open_trade: TradeRecord | None = None
     pending_entry:  tuple | None   = None
+    consec_losses   = 0    # consecutive SL hits counter
 
     # ── LOCK START PRICE ─────────────────────────────────────────────────────
     # Try day file first (exact real bot price)
@@ -378,6 +383,11 @@ def run_day(
                 open_trade.spread_cost = sp
                 open_trade.net_pnl     = round(gross - sp, 2)
                 open_trade = None
+                # Track consecutive losses for circuit breaker
+                if outcome == "SL":
+                    consec_losses += 1
+                else:
+                    consec_losses = 0
 
         # ── Step 2: daily gates ───────────────────────────────────────────────
         if is_daily_profit_hit(realized_pnl, cfg):
@@ -386,7 +396,15 @@ def run_day(
             report.hit_loss = True; break
         if trade_count >= cfg.max_trades_per_day:
             break
+        if consec_loss_pause > 0 and consec_losses >= consec_loss_pause:
+            report.hit_consec_pause = True; break
         if open_trade is not None or pending_entry is not None:
+            continue
+
+        # ── Step 3: session filter ───────────────────────────────────────────
+        if session_start_utc and bar.utc_hhmm < session_start_utc:
+            continue
+        if session_end_utc and bar.utc_hhmm >= session_end_utc:
             continue
 
         # ── Step 3: entry signal ──────────────────────────────────────────────
@@ -475,13 +493,16 @@ def run_day(
 W = 88
 
 def print_report(
-    reports:       list[DayReport],
-    cfg:           StrategyConfig,
-    months:        int,
-    symbol:        str,
-    close_confirm: bool = False,
-    trend_filter:  bool = False,
-    data_dir:      str  = "",
+    reports:            list[DayReport],
+    cfg:                StrategyConfig,
+    months:             int,
+    symbol:             str,
+    close_confirm:      bool = False,
+    trend_filter:       bool = False,
+    data_dir:           str  = "",
+    session_start_utc:  str  = "",
+    session_end_utc:    str  = "",
+    consec_loss_pause:  int  = 0,
 ):
     total_gross  = sum(r.day_gross  for r in reports)
     total_spread = sum(r.day_spread for r in reports)
@@ -497,6 +518,7 @@ def print_report(
     no_trig_days  = [r for r in reports if r.no_trigger]
     profit_days   = [r for r in reports if r.hit_profit]
     loss_lim_days = [r for r in reports if r.hit_loss]
+    consec_days   = [r for r in reports if r.hit_consec_pause]
     day_file_days = sum(1 for r in reports if r.start_source == "day_file")
 
     win_rate    = (all_tp / total_trades * 100) if total_trades else 0
@@ -509,6 +531,11 @@ def print_report(
 
     entry_mode = "CLOSE-CONFIRM+NEXT-BAR" if close_confirm else "TICK-TOUCH⚠️ (same-bar SL possible)"
     if trend_filter: entry_mode += "+TREND-FILTER"
+    if session_start_utc or session_end_utc:
+        sess = f"{session_start_utc or '00:00'}-{session_end_utc or '23:00'} UTC"
+        entry_mode += f"+SESSION({sess})"
+    if consec_loss_pause:
+        entry_mode += f"+CONSEC-PAUSE({consec_loss_pause})"
     start_mode = f"day_files({day_file_days}d)+bar_open_fallback" if data_dir else "bar_open(fallback only)"
 
     print(f"\n╔{sep}╗")
@@ -558,6 +585,8 @@ def print_report(
     print(kv("No-trigger days:", len(no_trig_days)))
     print(kv("Profit-stop days:", len(profit_days)))
     print(kv("Loss-limit days:", len(loss_lim_days)))
+    if consec_days:
+        print(kv("Consec-pause days:", len(consec_days)))
     print(kv("Start from day files:", f"{day_file_days} days (📂) vs {len(reports)-day_file_days} bar_open fallback (📊)"))
     print(f"║{thn}║")
     print(kv("Total trades:", total_trades))
@@ -677,8 +706,14 @@ Examples:
                    help="Entry on bar CLOSE, execute at next bar open. RECOMMENDED.")
     p.add_argument("--trend-filter",  action="store_true",
                    help="Only LONG if above start, SHORT if below start.")
-    p.add_argument("--session-start", type=str,   default="00:00")
-    p.add_argument("--session-end",   type=str,   default="23:00")
+    p.add_argument("--session-start",    type=str,   default="00:00")
+    p.add_argument("--session-end",      type=str,   default="23:00")
+    p.add_argument("--session-london-ny", action="store_true",
+                   help="Only enter during London+NY overlap: 07:00-16:00 UTC. "
+                        "Filters out Asian session fake breakouts.")
+    p.add_argument("--consec-loss-pause", type=int, default=0,
+                   help="Pause rest of day after N consecutive SL hits. "
+                        "E.g. --consec-loss-pause 2 stops after 2 SL hits in a row.")
     p.add_argument("--force-close",   type=str,   default="23:30")
     p.add_argument("--overshoot",     type=float, default=3.0)
     p.add_argument("--verbose",       action="store_true")
@@ -713,18 +748,28 @@ def main():
         if args.verbose:
             fb = day_bars[0]
             print(f"[BACKTEST] {date}  bars={len(day_bars)}  first={fb.utc_hhmm}  open={fb.open:.3f}")
+        sess_start = "07:00" if args.session_london_ny else ""
+        sess_end   = "16:00" if args.session_london_ny else ""
         reports.append(run_day(
             date, day_bars, cfg,
-            close_confirm = args.close_confirm,
-            trend_filter  = args.trend_filter,
-            data_dir      = args.data_dir,
+            close_confirm     = args.close_confirm,
+            trend_filter      = args.trend_filter,
+            data_dir          = args.data_dir,
+            session_start_utc = sess_start,
+            session_end_utc   = sess_end,
+            consec_loss_pause = args.consec_loss_pause,
         ))
 
+    sess_start = "07:00" if args.session_london_ny else ""
+    sess_end   = "16:00" if args.session_london_ny else ""
     print_report(
         reports, cfg, args.months, args.symbol,
-        close_confirm = args.close_confirm,
-        trend_filter  = args.trend_filter,
-        data_dir      = args.data_dir,
+        close_confirm     = args.close_confirm,
+        trend_filter      = args.trend_filter,
+        data_dir          = args.data_dir,
+        session_start_utc = sess_start,
+        session_end_utc   = sess_end,
+        consec_loss_pause = args.consec_loss_pause,
     )
 
 

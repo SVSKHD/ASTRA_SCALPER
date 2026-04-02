@@ -42,9 +42,9 @@ class TestConfig(unittest.TestCase):
         """5-pip SL: entry_multiplier=1.25 → 20×1.25=25"""
         self.assertAlmostEqual(self._c().entry_offset, 25.0)
 
-    def test_exit_offset_is_35(self):
-        """5-pip SL: exit_multiplier=1.75 → 20×1.75=35"""
-        self.assertAlmostEqual(self._c().exit_offset, 35.0)
+    def test_exit_offset_is_40(self):
+        """R:R 1:3: exit_multiplier=2.0 → 20×2.0=40"""
+        self.assertAlmostEqual(self._c().exit_offset, 40.0)
 
     def test_breakout_offset_is_20(self):
         self.assertAlmostEqual(self._c().breakout_offset, 20.0)
@@ -53,45 +53,45 @@ class TestConfig(unittest.TestCase):
         """5-pip default: entry_offset(25) − breakout_offset(20) = 5"""
         self.assertAlmostEqual(self._c().sl_pips, 5.0)
 
-    def test_tp_pips_is_10(self):
-        """5-pip default: exit(35) − entry(25) = 10 pips"""
-        self.assertAlmostEqual(self._c().tp_pips, 10.0)
+    def test_tp_pips_is_15(self):
+        """R:R 1:3: exit(40) − entry(25) = 15 pips"""
+        self.assertAlmostEqual(self._c().tp_pips, 15.0)
 
-    def test_rr_is_2(self):
-        """5-pip default: tp_pips(10) / sl_pips(5) = 2.0"""
-        self.assertAlmostEqual(self._c().risk_reward, 2.0)
+    def test_rr_is_3(self):
+        """R:R 1:3: tp_pips(15) / sl_pips(5) = 3.0"""
+        self.assertAlmostEqual(self._c().risk_reward, 3.0)
 
-    def test_breakeven_win_rate_33pct(self):
-        """5-pip default: sl/(sl+tp) = 5/15 = 0.333"""
-        self.assertAlmostEqual(self._c().breakeven_win_rate, round(5/15, 4))
+    def test_breakeven_win_rate_25pct(self):
+        """R:R 1:3: sl/(sl+tp) = 5/20 = 0.25"""
+        self.assertAlmostEqual(self._c().breakeven_win_rate, 0.25)
 
     def test_lot_size_from_sl_target(self):
-        # 5-pip default: lot = 100 / (5 × 100) = 0.2
-        self.assertAlmostEqual(self._c(account_size=10_000).lot_size, 0.2)
-        self.assertAlmostEqual(self._c(account_size=50_000).lot_size, 0.2)
-        self.assertAlmostEqual(self._c(account_size=100_000).lot_size, 0.2)
+        # R:R 1:3: lot = 200 / (5 × 100) = 0.4
+        self.assertAlmostEqual(self._c(account_size=10_000).lot_size, 0.4)
+        self.assertAlmostEqual(self._c(account_size=50_000).lot_size, 0.4)
+        self.assertAlmostEqual(self._c(account_size=100_000).lot_size, 0.4)
 
     def test_lot_size_changes_with_sl_target(self):
-        # $200 SL at 5 pips → 200/(5×100) = 0.4 lot
-        c = self._c(sl_dollar_target=200)
-        self.assertAlmostEqual(c.lot_size, 0.4)
+        # $400 SL at 5 pips → 400/(5×100) = 0.8 lot
+        c = self._c(sl_dollar_target=400)
+        self.assertAlmostEqual(c.lot_size, 0.8)
 
     def test_daily_loss_limit_default(self):
-        # Default daily loss = sl_dollar_target = $100
-        self.assertAlmostEqual(self._c(account_size=50_000).max_daily_loss_usd, 100.0)
+        # R:R 1:3: daily loss = $200 (1 SL hit)
+        self.assertAlmostEqual(self._c(account_size=50_000).max_daily_loss_usd, 200.0)
 
     def test_daily_profit_target_default(self):
-        self.assertEqual(self._c().daily_profit_target_usd, 200.0)
+        self.assertEqual(self._c().daily_profit_target_usd, 600.0)
 
     def test_sl_dollar_matches_target(self):
         # sl_dollar should equal sl_dollar_target
         c = self._c(account_size=50_000)
         self.assertAlmostEqual(c.sl_dollar, c.sl_dollar_target)
 
-    def test_tp_dollar_200(self):
-        # 5-pip default: tp=10 pips, 0.2 lot → 10×0.2×100 = $200
+    def test_tp_dollar_600(self):
+        # R:R 1:3: tp=15 pips, 0.4 lot → 15×0.4×100 = $600
         c = self._c(account_size=50_000)
-        self.assertAlmostEqual(c.tp_dollar, 200.0)
+        self.assertAlmostEqual(c.tp_dollar, 600.0)
 
     def test_summary_contains_account(self):
         self.assertIn("50,000", self._c(account_size=50_000).summary())
@@ -119,8 +119,8 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(self._lv(4513).long_entry, 4538.0)
 
     def test_long_tp(self):
-        """5-pip: start 4513, TP = 4513+35 = 4548"""
-        self.assertAlmostEqual(self._lv(4513).long_tp, 4548.0)
+        """R:R 1:3: start 4513, TP = 4513+40 = 4553"""
+        self.assertAlmostEqual(self._lv(4513).long_tp, 4553.0)
 
     def test_long_sl(self):
         """SL = breakout level = 4533"""
@@ -138,8 +138,8 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(self._lv(4513).short_entry, 4488.0)
 
     def test_short_tp(self):
-        """5-pip: start 4513, short TP = 4513-35 = 4478"""
-        self.assertAlmostEqual(self._lv(4513).short_tp, 4478.0)
+        """R:R 1:3: start 4513, short TP = 4513-40 = 4473"""
+        self.assertAlmostEqual(self._lv(4513).short_tp, 4473.0)
 
     def test_short_sl(self):
         self.assertAlmostEqual(self._lv(4513).short_sl, 4493.0)
@@ -149,10 +149,10 @@ class TestThreshold(unittest.TestCase):
         self.assertAlmostEqual(lv.short_sl, lv.short_breakout)
 
     def test_capture_per_trade(self):
-        """5-pip: capture = exit(35) - entry(25) = 10 pips"""
+        """R:R 1:3: capture = exit(40) - entry(25) = 15 pips"""
         lv = self._lv(4513)
-        self.assertAlmostEqual(lv.long_tp - lv.long_entry, 10.0)
-        self.assertAlmostEqual(lv.short_entry - lv.short_tp, 10.0)
+        self.assertAlmostEqual(lv.long_tp - lv.long_entry, 15.0)
+        self.assertAlmostEqual(lv.short_entry - lv.short_tp, 15.0)
 
     def test_symmetry(self):
         lv = self._lv(4500)
@@ -162,27 +162,27 @@ class TestThreshold(unittest.TestCase):
         lv = self._lv(4517)
         self.assertAlmostEqual(lv.long_entry,  4542.0)  # 4517+25
         self.assertAlmostEqual(lv.short_entry, 4492.0)  # 4517-25
-        self.assertAlmostEqual(lv.long_tp,     4552.0)  # 4517+35
-        self.assertAlmostEqual(lv.short_tp,    4482.0)  # 4517-35
+        self.assertAlmostEqual(lv.long_tp,     4557.0)  # 4517+40
+        self.assertAlmostEqual(lv.short_tp,    4477.0)  # 4517-40
 
     def test_27_mar_levels(self):
         lv = self._lv(4384)
         self.assertAlmostEqual(lv.long_entry,  4409.0)  # 4384+25
         self.assertAlmostEqual(lv.short_entry, 4359.0)  # 4384-25
-        self.assertAlmostEqual(lv.long_tp,     4419.0)  # 4384+35
+        self.assertAlmostEqual(lv.long_tp,     4424.0)  # 4384+40
 
     def test_31_mar_levels(self):
         lv = self._lv(4513)
         self.assertAlmostEqual(lv.long_entry,  4538.0)  # 4513+25
         self.assertAlmostEqual(lv.short_entry, 4488.0)  # 4513-25
-        self.assertAlmostEqual(lv.long_tp,     4548.0)  # 4513+35
-        self.assertAlmostEqual(lv.short_tp,    4478.0)  # 4513-35
+        self.assertAlmostEqual(lv.long_tp,     4553.0)  # 4513+40
+        self.assertAlmostEqual(lv.short_tp,    4473.0)  # 4513-40
 
     def test_display_runs(self):
         lv = self._lv(4513)
         s = lv.display()
         self.assertIn("4538", s)
-        self.assertIn("4548", s)
+        self.assertIn("4553", s)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -214,9 +214,9 @@ class TestTradeSignal(unittest.TestCase):
         self.assertEqual(sig.direction, "LONG")
 
     def test_long_tp_is_exit_multiplier(self):
-        """TP at exit_multiplier(1.75)× = S + 35 = 4548"""
+        """TP at exit_multiplier(2.0)× = S + 40 = 4553"""
         sig = self._ev(4538.0)
-        self.assertAlmostEqual(sig.tp_price, 4548.0)
+        self.assertAlmostEqual(sig.tp_price, 4553.0)
 
     def test_long_sl_at_breakout(self):
         """SL at 1.0× = S + 20 = 4533"""
@@ -229,9 +229,9 @@ class TestTradeSignal(unittest.TestCase):
         self.assertEqual(sig.direction, "SHORT")
 
     def test_short_tp_is_exit_multiplier(self):
-        """Short TP = S - 35 = 4478"""
+        """Short TP = S - 40 = 4473"""
         sig = self._ev(4488.0)
-        self.assertAlmostEqual(sig.tp_price, 4478.0)
+        self.assertAlmostEqual(sig.tp_price, 4473.0)
 
     def test_short_sl_at_breakout(self):
         """Short SL = S - 20 = 4493 (short entry = 4488)"""
@@ -502,7 +502,7 @@ class TestRiskControl(unittest.TestCase):
 
     def test_limit_breached_exact(self):
         from risk_control import is_daily_limit_breached
-        self.assertTrue(is_daily_limit_breached(-100.0, self._cfg()))
+        self.assertTrue(is_daily_limit_breached(-200.0, self._cfg()))
 
     def test_simulate_first_win_hits_profit_target(self):
         from risk_control import simulate_day
