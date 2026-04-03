@@ -5,6 +5,7 @@ from __future__ import annotations
 # Reads start price from: data/start_price/<symbol>.json
 # =============================================================================
 
+import sys
 import time
 import logging
 import MetaTrader5 as mt5
@@ -48,6 +49,13 @@ try:
 except Exception as _e:
     SIGNAL_FILTER = False
     print(f"[Runner] signal_filter not loaded: {_e}")
+
+try:
+    from telegram_commands import CommandListener
+    CMD_LISTENER = True
+except Exception as _e:
+    CMD_LISTENER = False
+    print(f"[Runner] telegram_commands not loaded: {_e}")
 
 log = logging.getLogger("runner")
 
@@ -418,6 +426,17 @@ def run():
     last_log_ts  = 0.0
     last_warn_ts = 0.0
 
+    # ── TELEGRAM COMMAND LISTENER ───────────────────────────────────────────
+    cmd_listener = None
+    if CMD_LISTENER:
+        cmd_listener = CommandListener(
+            state       = state,
+            cfg         = cfg,
+            get_pnl_fn  = lambda: calculate_day_pnl(cfg),
+            get_open_fn = lambda: calculate_open_pnl(cfg),
+        )
+        cmd_listener.start()
+
     print(f"[{cfg.symbol}] Waiting for start price...")
     print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
     if SIGNAL_LOGGER:
@@ -456,6 +475,8 @@ def run():
                     state.reset(file_date, _prev, _consec)
                     force_closed = False
                     print(f"[{cfg.symbol}] DAY ROLLOVER → {file_date}")
+                    if cmd_listener:
+                        cmd_listener._state = state
 
             today = today_utc
 
@@ -618,6 +639,12 @@ def run():
                     f"PnL=${realized:+.2f} | Budget=${budget:.0f}"
                 )
                 last_log_ts = now
+
+            # ── TELEGRAM COMMAND: /restart ───────────────────────────────────────
+            if cmd_listener and cmd_listener.restart_requested:
+                print(f"[{cfg.symbol}] /restart received — exiting with code 42 for watchdog relaunch")
+                close_all_by_magic(cfg)
+                sys.exit(42)   # watchdog treats 42 as "restart" not crash
 
             # ── SIGNAL → FILTER → LOG → ORDER ────────────────────────────────
             sig = evaluate_signal(mid, state.levels, state.already_traded, cfg)

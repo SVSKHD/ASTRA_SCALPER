@@ -257,15 +257,17 @@ def _in_time_blackout(hhmm: str) -> bool:
 # INTRABAR EXECUTION ENGINE
 # =============================================================================
 
-SPREAD_PIP = 0.35
+SPREAD_PIP       = 0.35   # default XAUUSD
+_PIP_VALUE       = 100.0  # $100/pip/lot for XAUUSD — overridden by --pip-value
+_SPREAD_PIPS     = 0.35   # spread in pips — overridden by --spread
 
 
 def _spread_cost(lot_size: float) -> float:
-    return round(SPREAD_PIP * 100.0 * lot_size, 2)
+    return round(_SPREAD_PIPS * _PIP_VALUE * lot_size, 2)
 
 
 def _pnl(direction: Direction, entry: float, exit_p: float, lot_size: float) -> float:
-    ppl = lot_size * 100.0
+    ppl = lot_size * _PIP_VALUE
     return round(
         (exit_p - entry) * ppl if direction == "LONG"
         else (entry - exit_p) * ppl, 2
@@ -507,7 +509,11 @@ def run_day(
             report.hit_profit = True; break
         if is_daily_limit_breached(realized_pnl, active_cfg):
             report.hit_loss = True; break
-        if trade_count >= active_cfg.max_trades_per_day:
+        # Only stop looking for NEW trades when limit reached.
+        # If a position is still open, keep iterating to resolve it.
+        if (trade_count >= active_cfg.max_trades_per_day
+                and open_trade is None
+                and pending_entry is None):
             break
         if consec_loss_pause > 0 and consec_losses >= consec_loss_pause:
             report.hit_consec_pause = True; break
@@ -806,19 +812,24 @@ def _make_cfg(args) -> StrategyConfig:
     sl_pips_raw = 2.0
     rr = args.tp_target / args.sl_target
 
+    # Use the actual threshold as base (handles silver, forex, etc.)
+    # Default = 20.0 (XAUUSD baseline)
+    base_threshold = getattr(args, 'threshold_pips', 0.0) or 20.0
+
     sl_pips_override = getattr(args, 'sl_pips', None)
     if sl_pips_override and sl_pips_override != sl_pips_raw:
-        entry_offset   = 20.0 + sl_pips_override
+        # Compute multipliers relative to the actual threshold being used
+        entry_offset   = base_threshold + sl_pips_override
         tp_pips        = sl_pips_override * rr
         exit_offset    = entry_offset + tp_pips
-        entry_mult     = round(entry_offset / 20.0, 4)
-        exit_mult      = round(exit_offset  / 20.0, 4)
+        entry_mult     = round(entry_offset / base_threshold, 6)
+        exit_mult      = round(exit_offset  / base_threshold, 6)
     else:
         sl_pips_override = sl_pips_raw
         tp_pips          = sl_pips_raw * rr
-        exit_offset      = 22.0 + tp_pips
-        entry_mult       = 1.1
-        exit_mult        = round(exit_offset / 20.0, 4)
+        exit_offset      = base_threshold + sl_pips_raw + tp_pips
+        entry_mult       = round((base_threshold + sl_pips_raw) / base_threshold, 6)
+        exit_mult        = round(exit_offset / base_threshold, 6)
 
     from dataclasses import replace as dc_replace
 
@@ -931,6 +942,10 @@ Examples:
                         "daily-loss auto-scales to N × sl-target unless --daily-loss also set.")
     p.add_argument("--threshold-pips", type=float, default=0.0,
                    help="Override threshold pips for backtest only (e.g. 30)")
+    p.add_argument("--pip-value",  type=float, default=100.0,
+                   help="Dollar value per pip per lot. XAUUSD=100, XAGUSD=50, EURUSD=10. Default 100.")
+    p.add_argument("--spread",     type=float, default=0.35,
+                   help="Spread in pips. XAUUSD≈0.35, XAGUSD≈1.5, EURUSD≈0.5. Default 0.35.")
     return p.parse_args()
 
 
@@ -957,6 +972,14 @@ def main():
                   f"daily-loss auto-scaled to ${args.daily_loss:.0f} "
                   f"({args.max_trades}×${args.sl_target:.0f})")
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Set pip value and spread for this symbol ─────────────────────────
+    global _PIP_VALUE, _SPREAD_PIPS
+    _PIP_VALUE   = args.pip_value
+    _SPREAD_PIPS = args.spread
+    print(f"[BACKTEST] Symbol pip value : ${_PIP_VALUE:.0f}/pip/lot")
+    print(f"[BACKTEST] Spread           : {_SPREAD_PIPS} pips")
+    # ─────────────────────────────────────────────────────────────────────
 
     cfg = _make_cfg(args)
     print(cfg.summary())

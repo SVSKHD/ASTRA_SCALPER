@@ -179,10 +179,16 @@ def run_watchdog(
             returncode  = -1
             output_tail = str(e)
 
-        # Clean exit → intentional stop
+        # Clean exit (code 0) → intentional stop
         if returncode == 0:
             log.info("✅ Runner exited cleanly (code 0). Watchdog stopping.")
             break
+
+        # Restart requested via /restart command (code 42) → relaunch without crash log
+        if returncode == 42:
+            log.info("🔄 Restart requested (code 42) — relaunching runner.py...")
+            time.sleep(3.0)
+            continue
 
         # Crash
         restart_count += 1
