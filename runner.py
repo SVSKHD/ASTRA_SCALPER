@@ -130,6 +130,13 @@ class DayState:
         self.pending_signal:   Signal | None = None
         self.pending_bar_slot: str           = ""
         self.pending_log_id:   str           = ""
+        # ── DAY RANGE TELEMETRY ───────────────────────────────────────────
+        # Track how far price has moved from start in each direction today.
+        # Updated on every mid price tick in the main loop.
+        self.day_high:      float = 0.0   # highest mid seen today
+        self.day_low:       float = 0.0   # lowest mid seen today
+        self.day_high_time: str   = ""    # IST time string of day high
+        self.day_low_time:  str   = ""    # IST time string of day low
 
     def reset(self, date: str,
               prev_outcome: str = "UNKNOWN",
@@ -154,6 +161,11 @@ class DayState:
         self.pending_signal      = None
         self.pending_bar_slot    = ""
         self.pending_log_id      = ""
+        # Day range resets each day
+        self.day_high      = 0.0
+        self.day_low       = 0.0
+        self.day_high_time = ""
+        self.day_low_time  = ""
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
     def track_position(self, ticket: int, fill_price: float,
@@ -480,6 +492,136 @@ def _print_day_levels(levels: ThresholdLevels):
     print(levels.display())
 
 
+def _catchup_analysis(state: DayState) -> None:
+    """
+    Called once after start price is locked on bot startup.
+    Fetches all M5 bars from UTC midnight to now and reports:
+      - Day high / low from start price
+      - Whether any entry level was crossed while the bot was offline
+      - Estimated P&L of the missed trade (if any)
+    Sends a Telegram alert if a missed trade is detected.
+    """
+    if state.start_price is None or state.levels is None:
+        return
+
+    now_utc     = datetime.now(timezone.utc)
+    midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    lv          = state.levels
+    start       = state.start_price
+
+    try:
+        bars = mt5.copy_rates_range(cfg.symbol, mt5.TIMEFRAME_M5, midnight, now_utc)
+    except Exception as e:
+        print(f"[{cfg.symbol}] CATCHUP: failed to fetch bars — {e}")
+        return
+
+    if bars is None or len(bars) == 0:
+        print(f"[{cfg.symbol}] CATCHUP: no M5 bars available since midnight UTC")
+        return
+
+    # ── scan bars for high/low and entry crossings ────────────────────────
+    day_high = day_low = float(bars[0][1])   # open of first bar
+    day_high_bar = day_low_bar = None
+
+    long_entry_crossed  = False
+    short_entry_crossed = False
+    long_tp_crossed     = False
+    short_tp_crossed    = False
+    long_cross_time     = ""
+    short_cross_time    = ""
+
+    for b in bars:
+        bar_time = datetime.fromtimestamp(int(b[0]), tz=timezone.utc).astimezone(_IST)
+        bar_time_str = bar_time.strftime("%H:%M IST")
+        hi = float(b[2])
+        lo = float(b[3])
+
+        if hi > day_high:
+            day_high = hi
+            day_high_bar = bar_time_str
+        if lo < day_low:
+            day_low = lo
+            day_low_bar = bar_time_str
+
+        if not long_entry_crossed and hi >= lv.long_entry:
+            long_entry_crossed = True
+            long_cross_time    = bar_time_str
+        if long_entry_crossed and not long_tp_crossed and hi >= lv.long_tp:
+            long_tp_crossed = True
+
+        if not short_entry_crossed and lo <= lv.short_entry:
+            short_entry_crossed = True
+            short_cross_time    = bar_time_str
+        if short_entry_crossed and not short_tp_crossed and lo <= lv.short_tp:
+            short_tp_crossed = True
+
+    # seed DayState high/low so status log is accurate immediately
+    state.day_high      = day_high
+    state.day_low       = day_low
+    state.day_high_time = day_high_bar or ""
+    state.day_low_time  = day_low_bar  or ""
+
+    up_pips   = round(day_high - start, 1)
+    down_pips = round(start - day_low,  1)
+
+    sep = "─" * 62
+    print(f"\n[{cfg.symbol}] CATCHUP ANALYSIS ── since midnight UTC")
+    print(sep)
+    print(f"  Start price : {start:.2f}")
+    print(f"  Day high    : {day_high:.2f}  ({up_pips:+.1f} pips)  @ {day_high_bar}")
+    print(f"  Day low     : {day_low:.2f}  (-{down_pips:.1f} pips)  @ {day_low_bar}")
+    print(f"  Bars scanned: {len(bars)}")
+    print(sep)
+
+    missed_direction = ""
+    missed_pnl       = 0.0
+
+    if long_entry_crossed:
+        tp_tag = f"TP HIT ({lv.long_tp:.2f}) → +${cfg.tp_dollar:.0f}" if long_tp_crossed else f"TP NOT hit ({lv.long_tp:.2f})"
+        print(f"  ⚠️  MISSED LONG — entry {lv.long_entry:.2f} crossed @ {long_cross_time}  |  {tp_tag}")
+        # Mark LONG consumed — blocks re-entry if price drops back through long entry.
+        # A pullback re-entry is not a fresh breakout; it's a reversal trap.
+        state.already_traded.add("LONG")
+        print(f"  → LONG marked consumed — re-entry on pullback blocked for today")
+        if long_tp_crossed:
+            missed_direction = "LONG"
+            missed_pnl       = cfg.tp_dollar
+
+    if short_entry_crossed:
+        tp_tag = f"TP HIT ({lv.short_tp:.2f}) → +${cfg.tp_dollar:.0f}" if short_tp_crossed else f"TP NOT hit ({lv.short_tp:.2f})"
+        print(f"  ⚠️  MISSED SHORT — entry {lv.short_entry:.2f} crossed @ {short_cross_time}  |  {tp_tag}")
+        # Mark SHORT consumed — blocks re-entry as price recovers back through short entry.
+        # Today's case: crashed to 4604, recovering toward 4648. Do NOT short the recovery.
+        state.already_traded.add("SHORT")
+        print(f"  → SHORT marked consumed — re-entry on recovery blocked for today")
+        if short_tp_crossed:
+            missed_direction = "SHORT"
+            missed_pnl       = cfg.tp_dollar
+
+    if not long_entry_crossed and not short_entry_crossed:
+        print(f"  ✅ No entry level crossed while offline — nothing missed")
+
+    print(sep + "\n")
+
+    # ── Telegram alert for missed full trade ──────────────────────────────
+    if missed_direction and TELEGRAM:
+        msg = (
+            f"<b>⚠️ MISSED TRADE — {cfg.symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Bot was offline during the move.\n"
+            f"Direction : {missed_direction}\n"
+            f"Entry crossed : "
+            f"{lv.long_entry:.2f} @ {long_cross_time}" if missed_direction == "LONG"
+            else f"{lv.short_entry:.2f} @ {short_cross_time}\n"
+            f"TP hit    : YES → +${missed_pnl:.0f} left on the table\n"
+            f"Day low   : {day_low:.2f}  (-{down_pips:.1f} pips from start)\n"
+            f"Day high  : {day_high:.2f}  (+{up_pips:.1f} pips from start)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Bot is now live. Next signal will fire."
+        )
+        _tg_safe(lambda m: __import__('telegram_notify', fromlist=['send']).send(m), msg)
+
+
 def run():
     print(cfg.summary())
     if not mt5.initialize():
@@ -558,6 +700,7 @@ def run():
                 state.start_price = price
                 state.levels      = compute_levels(price, cfg)
                 _print_day_levels(state.levels)
+                _catchup_analysis(state)   # scan bars since midnight, report missed moves
 
                 if TELEGRAM and "day_start" not in state.notified_today:
                     lv = state.levels
@@ -695,6 +838,16 @@ def run():
                 time.sleep(cfg.poll_seconds)
                 continue
 
+            # ── TRACK DAY HIGH / LOW ──────────────────────────────────────────
+            if state.start_price is not None:
+                now_ist_str = datetime.now(timezone.utc).astimezone(_IST).strftime("%H:%M IST")
+                if state.day_high == 0.0 or mid > state.day_high:
+                    state.day_high      = mid
+                    state.day_high_time = now_ist_str
+                if state.day_low == 0.0 or mid < state.day_low:
+                    state.day_low      = mid
+                    state.day_low_time = now_ist_str
+
             # ── STATUS LOG (every 30s) ───────────────────────────────────────
             now = time.time()
             if now - last_log_ts >= 30.0:
@@ -731,9 +884,13 @@ def run():
                         trade_status = f"👀 NO TRADE — {dist_short:.1f} pips to SHORT entry ({lv.short_entry:.2f})"
 
                 now_ist = datetime.now(timezone.utc).astimezone(_IST)
+                up_pips   = round(state.day_high - state.start_price, 1) if state.day_high else 0.0
+                down_pips = round(state.start_price - state.day_low,  1) if state.day_low  else 0.0
                 print(
                     f"\n[{cfg.symbol}] ── {now_ist.strftime('%H:%M:%S IST')} ──────────────────────────────\n"
                     f"  Start     : {state.start_price:.2f}  →  Mid: {mid:.2f}  |  {direction}\n"
+                    f"  Day range : ▲ high {state.day_high:.2f} (+{up_pips:.1f} pips) @ {state.day_high_time}"
+                    f"  |  ▼ low {state.day_low:.2f} (-{down_pips:.1f} pips) @ {state.day_low_time}\n"
                     f"  Levels    : L-entry={lv.long_entry:.2f}  L-TP={lv.long_tp:.2f}  |  "
                     f"S-entry={lv.short_entry:.2f}  S-TP={lv.short_tp:.2f}\n"
                     f"  Trade     : {trade_status}\n"
@@ -780,6 +937,36 @@ def run():
                         f"[{cfg.symbol}] TREND FILTER BLOCKED | {sig.direction} | "
                         f"mid={mid:.3f} start={state.start_price:.3f}"
                     )
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+                # Step 2b: RE-ENTRY GUARD ──────────────────────────────────────
+                # Block signals where price has already made a full excursion
+                # through the entry level today and is now recovering back through it.
+                # Example: price crashed through short entry (4648) to 4604, now
+                # bouncing UP back through 4648. That is a recovery, not a fresh
+                # short breakout. Shorting a recovery is a reversal trap.
+                #
+                # Rule: SHORT blocked if day_low is already below short_entry
+                #        LONG  blocked if day_high is already above long_entry
+                # (day_high/day_low are seeded by catchup and updated live every tick)
+                if sig.direction == "SHORT" and state.day_low > 0 and state.day_low < state.levels.short_entry:
+                    print(
+                        f"[{cfg.symbol}] RE-ENTRY BLOCKED | SHORT | "
+                        f"day_low={state.day_low:.2f} already below entry={state.levels.short_entry:.2f} — "
+                        f"recovery re-entry, not a fresh breakout"
+                    )
+                    state.already_traded.add("SHORT")   # consume so this check is instant next poll
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+                if sig.direction == "LONG" and state.day_high > 0 and state.day_high > state.levels.long_entry:
+                    print(
+                        f"[{cfg.symbol}] RE-ENTRY BLOCKED | LONG | "
+                        f"day_high={state.day_high:.2f} already above entry={state.levels.long_entry:.2f} — "
+                        f"pullback re-entry, not a fresh breakout"
+                    )
+                    state.already_traded.add("LONG")    # consume so this check is instant next poll
                     time.sleep(cfg.poll_seconds)
                     continue
 
