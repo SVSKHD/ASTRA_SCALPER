@@ -62,7 +62,7 @@ class CommandListener:
         self._get_pnl     = get_pnl_fn
         self._get_open    = get_open_fn
         self._offset      = 0
-        self._poll_sec    = 3.0
+        self._poll_sec    = 1.0
         self._thread: threading.Thread | None = None
         self.restart_requested: bool = False
 

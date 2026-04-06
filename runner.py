@@ -64,6 +64,13 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 _MAX_CLOSE_RETRIES = 3
 
+# Overshoot tolerance at close-confirm execution time.
+# 3 pips (config default) was killing every fast move — close-confirm delays
+# entry by one full M5 bar, so next-bar open is routinely 5-10 pips past
+# the entry level on any clean directional day. 8 pips gives enough room
+# while still rejecting genuine gap-chases.
+_MAX_OVERSHOOT_PIPS: float = 8.0
+
 
 def _tg_safe(fn, *args, **kwargs):
     if not TELEGRAM:
@@ -337,21 +344,27 @@ def _handle_signal_execute(signal: Signal, state: DayState, pre_log_id: str = ""
     hour_utc    = now_utc.hour
     day_of_week = now_utc.weekday()   # 0=Mon, 4=Fri
 
-    # ── RULE-BASED FILTERS ────────────────────────────────────────────────
+    # ── RULE-BASED FILTERS — ALL DISABLED ────────────────────────────────
+    # ATR filter: blocks any elevated-ATR day — which is every clean
+    #   directional move. A 35-pip smooth run IS elevated ATR by definition.
+    # Candle filter: body < 45% blocks valid breakouts with wicks. Not
+    #   relevant for a one-trade-per-day threshold strategy.
+    # Session filter: was blocking Mon 00-06 UTC (05:30-11:30 IST) — the
+    #   cleanest directional gold window before London noise arrives.
+    # Remaining guards: trend filter + close-confirm + overshoot + daily loss limit.
     filter_reason = ""
     if SIGNAL_FILTER:
         result = apply_filters(
-            bars_m5       = state._recent_bars_m5,
-            hour_utc      = hour_utc,
-            day_of_week   = day_of_week,
-            enable_atr    = True,
-            enable_candle = True,
-            enable_session= True,
+            bars_m5        = state._recent_bars_m5,
+            hour_utc       = hour_utc,
+            day_of_week    = day_of_week,
+            enable_atr     = False,
+            enable_candle  = False,
+            enable_session = False,
         )
         if not result.passed:
             filter_reason = result.reason
             print(f"[{cfg.symbol}] SIGNAL FILTERED | {signal.direction} | {filter_reason}")
-            # Log the skipped signal for ML training data
             if SIGNAL_LOGGER:
                 log_signal(
                     signal             = signal,
@@ -396,12 +409,12 @@ def _handle_signal_execute(signal: Signal, state: DayState, pre_log_id: str = ""
             overshoot = fill_price_est - signal.entry_price
         else:
             overshoot = signal.entry_price - fill_price_est
-        if overshoot > cfg.max_entry_overshoot_pips:
+        if overshoot > _MAX_OVERSHOOT_PIPS:
             log.warning(
                 f"[{cfg.symbol}] OVERSHOOT BLOCKED | {signal.direction} | "
-                f"overshoot={overshoot:.2f} > max={cfg.max_entry_overshoot_pips}"
+                f"overshoot={overshoot:.2f} > max={_MAX_OVERSHOOT_PIPS}"
             )
-            print(f"[{cfg.symbol}] OVERSHOOT BLOCKED | overshoot={overshoot:.2f} pips")
+            print(f"[{cfg.symbol}] OVERSHOOT BLOCKED | overshoot={overshoot:.2f} pips (limit={_MAX_OVERSHOOT_PIPS})")
             if SIGNAL_LOGGER and log_id:
                 _log_update_outcome(log_id, "SKIPPED", 0.0)
             return False
@@ -492,11 +505,12 @@ def run():
     print(f"[{cfg.symbol}] Waiting for start price...")
     print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
     print(f"[{cfg.symbol}] Entry mode     : CLOSE-CONFIRM (waits for M5 bar close)")
+    print(f"[{cfg.symbol}] Overshoot limit: {_MAX_OVERSHOOT_PIPS} pips (close-confirm execution tolerance)")
     print(f"[{cfg.symbol}] Trend filter   : ACTIVE (LONG only above start, SHORT only below)")
+    print(f"[{cfg.symbol}] Rule filters   : DISABLED (ATR=off, candle=off, session=off)")
+    print(f"[{cfg.symbol}] Protection     : trend-filter + close-confirm + overshoot + daily-loss-limit")
     if SIGNAL_LOGGER:
         print(f"[{cfg.symbol}] Signal logger  : ACTIVE  → data/signal_log.csv")
-    if SIGNAL_FILTER:
-        print(f"[{cfg.symbol}] Rule filters   : ACTIVE  → ATR / candle / session")
 
     while True:
         try:
@@ -591,10 +605,11 @@ def run():
                 time.sleep(60.0)
                 continue
 
-            # ── FETCH M5 BARS (for ML features + ATR filter) ─────────────────
-            bars = _fetch_m5_bars(cfg.symbol, 40)
-            if bars:
-                state._recent_bars_m5 = bars
+            # ── FETCH M5 BARS — only needed for signal_logger ML training data ──
+            if SIGNAL_LOGGER:
+                bars = _fetch_m5_bars(cfg.symbol, 40)
+                if bars:
+                    state._recent_bars_m5 = bars
 
             # ── BUG 2 FIX: update closed positions ───────────────────────────
             closed_positions = state.update_closed_positions()
@@ -683,19 +698,47 @@ def run():
             # ── STATUS LOG (every 30s) ───────────────────────────────────────
             now = time.time()
             if now - last_log_ts >= 30.0:
-                budget = cfg.max_daily_loss_usd - abs(min(realized, 0))
-                pending_tag = (
-                    f" | PENDING={state.pending_signal.direction}@{state.pending_bar_slot}"
-                    if state.pending_signal else ""
-                )
+                budget      = cfg.max_daily_loss_usd - abs(min(realized, 0))
+                pips_from_s = round(mid - state.start_price, 2)
+                direction   = f"▲ UP   +{pips_from_s:.1f} pips" if pips_from_s >= 0 else f"▼ DOWN  {pips_from_s:.1f} pips"
+                lv          = state.levels
+
+                # trade status line
+                if state.pending_signal is not None:
+                    trade_status = (
+                        f"⏳ PENDING {state.pending_signal.direction} "
+                        f"@ bar {state.pending_bar_slot} — waiting for bar close"
+                    )
+                elif state.trade_count > 0 and state._tracked_positions:
+                    pos   = state._tracked_positions[0]
+                    pips_live = (
+                        round(mid - pos["fill_price"], 2) if pos["direction"] == "LONG"
+                        else round(pos["fill_price"] - mid, 2)
+                    )
+                    trade_status = (
+                        f"🟢 IN TRADE {pos['direction']} | fill={pos['fill_price']:.2f} | "
+                        f"live={pips_live:+.1f} pips | TP={pos['tp_price']:.2f} SL={pos['sl_price']:.2f}"
+                    )
+                elif state.trade_count > 0:
+                    trade_status = f"✅ DONE — {state.trade_count} trade(s) closed today | PnL=${realized:+.2f}"
+                else:
+                    # show distance to nearest entry
+                    dist_long  = round(lv.long_entry  - mid, 1)
+                    dist_short = round(mid - lv.short_entry, 1)
+                    if dist_long <= dist_short:
+                        trade_status = f"👀 NO TRADE — {dist_long:.1f} pips to LONG entry ({lv.long_entry:.2f})"
+                    else:
+                        trade_status = f"👀 NO TRADE — {dist_short:.1f} pips to SHORT entry ({lv.short_entry:.2f})"
+
+                now_ist = datetime.now(timezone.utc).astimezone(_IST)
                 print(
-                    f"[{cfg.symbol}] {session_status(cfg)} | "
-                    f"Mid={mid:.2f} | "
-                    f"LEntry={state.levels.long_entry:.2f} | "
-                    f"SEntry={state.levels.short_entry:.2f} | "
-                    f"Trades={state.trade_count}/{cfg.max_trades_per_day} | "
-                    f"PnL=${realized:+.2f} | Budget=${budget:.0f}"
-                    f"{pending_tag}"
+                    f"\n[{cfg.symbol}] ── {now_ist.strftime('%H:%M:%S IST')} ──────────────────────────────\n"
+                    f"  Start     : {state.start_price:.2f}  →  Mid: {mid:.2f}  |  {direction}\n"
+                    f"  Levels    : L-entry={lv.long_entry:.2f}  L-TP={lv.long_tp:.2f}  |  "
+                    f"S-entry={lv.short_entry:.2f}  S-TP={lv.short_tp:.2f}\n"
+                    f"  Trade     : {trade_status}\n"
+                    f"  Risk      : PnL=${realized:+.2f}  Budget=${budget:.0f}  "
+                    f"Trades={state.trade_count}/{cfg.max_trades_per_day}  {session_status(cfg)}\n"
                 )
                 last_log_ts = now
 
