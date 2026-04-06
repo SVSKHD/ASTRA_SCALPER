@@ -115,6 +115,14 @@ class DayState:
         self.consecutive_losses:  int   = 0
         self._current_log_id:     str   = ""         # updated after close
         self._recent_bars_m5:     list  = []         # last 40 M5 bars
+        # ── CLOSE-CONFIRM STATE ───────────────────────────────────────────
+        # Signal detected on bar N — execute at open of bar N+1.
+        # pending_signal      : the signal waiting for next bar
+        # pending_bar_slot    : 5-min slot string when signal fired ("HH:MM")
+        # pending_log_id      : signal_logger id for the pending signal
+        self.pending_signal:   Signal | None = None
+        self.pending_bar_slot: str           = ""
+        self.pending_log_id:   str           = ""
 
     def reset(self, date: str,
               prev_outcome: str = "UNKNOWN",
@@ -135,6 +143,10 @@ class DayState:
         self.consecutive_losses  = consec_losses
         self._current_log_id     = ""
         self._recent_bars_m5     = []
+        # Close-confirm state resets each day
+        self.pending_signal      = None
+        self.pending_bar_slot    = ""
+        self.pending_log_id      = ""
         print(f"\n{'='*55}\n  DAY RESET → {date}\n{'='*55}\n")
 
     def track_position(self, ticket: int, fill_price: float,
@@ -245,7 +257,39 @@ def _fetch_m5_bars(symbol: str, count: int = 40) -> list:
         return []
 
 
+def _current_bar_slot(now_utc: datetime | None = None) -> str:
+    """
+    Returns the current M5 bar slot as 'HH:MM' (floored to 5-min boundary).
+    e.g. any time between 02:10:00 and 02:14:59 → '02:10'
+    Used by close-confirm to detect when the next bar has opened.
+    """
+    t = now_utc or datetime.now(timezone.utc)
+    slot_min = (t.minute // 5) * 5
+    return f"{t.hour:02d}:{slot_min:02d}"
+
+
+def _trend_filter_ok(direction: str, mid: float, start_price: float) -> bool:
+    """
+    Mirrors backtest --trend-filter exactly.
+    LONG  only allowed when mid >= start_price (price above day anchor).
+    SHORT only allowed when mid <= start_price (price below day anchor).
+    """
+    if direction == "LONG":
+        return mid >= start_price
+    else:
+        return mid <= start_price
+
+
 def _force_close(state: DayState):
+    # Cancel any pending close-confirm signal — don't execute after EOD
+    if state.pending_signal is not None:
+        print(f"[{cfg.symbol}] FORCE CLOSE — cancelling pending {state.pending_signal.direction} signal")
+        if SIGNAL_LOGGER and state.pending_log_id:
+            _log_update_outcome(state.pending_log_id, "SKIPPED", 0.0)
+        state.pending_signal   = None
+        state.pending_bar_slot = ""
+        state.pending_log_id   = ""
+
     print(f"[{cfg.symbol}] FORCE CLOSE — EOD")
     results = close_all_by_magic(cfg)
     for r in results:
@@ -275,8 +319,13 @@ def _force_close(state: DayState):
     _tg_safe(notify_day_end, cfg.symbol, state.date, state.trade_count, pnl)
 
 
-def _handle_signal(signal: Signal, state: DayState) -> bool:
-
+def _handle_signal_execute(signal: Signal, state: DayState, pre_log_id: str = "") -> bool:
+    """
+    Execute a confirmed signal (close-confirm already passed).
+    Called on the NEW bar after signal was detected on previous bar.
+    Risk check was done pre-confirmation — we do a final check here
+    in case P&L changed while waiting for bar close.
+    """
     # ── Fetch current spread ──────────────────────────────────────────────
     spread_pips = 0.0
     tick = mt5.symbol_info_tick(cfg.symbol)
@@ -316,8 +365,8 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             return False
 
     # ── LOG SIGNAL (will be traded — outcome=PENDING) ─────────────────────
-    log_id = ""
-    if SIGNAL_LOGGER:
+    log_id = pre_log_id
+    if SIGNAL_LOGGER and not log_id:
         log_id = log_signal(
             signal             = signal,
             bars_m5            = state._recent_bars_m5,
@@ -329,7 +378,18 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
         )
         state._current_log_id = log_id
 
-    # ── BUG 1 FIX: overshoot filter ──────────────────────────────────────
+    # ── FINAL RISK CHECK (re-check in case P&L changed during bar wait) ──
+    snap = _snapshot(state.trade_count, state.internal_pnl)
+    allowed, reason = can_place_trade(snap, cfg)
+    if not allowed:
+        print(f"[{cfg.symbol}] BLOCKED (post-confirm) | {reason}")
+        if SIGNAL_LOGGER and log_id:
+            _log_update_outcome(log_id, "SKIPPED", 0.0)
+        return False
+
+    # ── OVERSHOOT CHECK at execution time ────────────────────────────────
+    # On close-confirm the entry is at next bar open — check we haven't
+    # gapped past the entry level by more than the allowed overshoot.
     fill_price_est = _live_fill_price(cfg.symbol, signal.direction)
     if fill_price_est is not None:
         if signal.direction == "LONG":
@@ -345,14 +405,6 @@ def _handle_signal(signal: Signal, state: DayState) -> bool:
             if SIGNAL_LOGGER and log_id:
                 _log_update_outcome(log_id, "SKIPPED", 0.0)
             return False
-
-    snap = _snapshot(state.trade_count, state.internal_pnl)
-    allowed, reason = can_place_trade(snap, cfg)
-    if not allowed:
-        print(f"[{cfg.symbol}] BLOCKED | {reason}")
-        if SIGNAL_LOGGER and log_id:
-            _log_update_outcome(log_id, "SKIPPED", 0.0)
-        return False
 
     print(f"\n[{cfg.symbol}] {signal}")
     print(loss_scenario_summary(snap.realized_pnl, cfg))
@@ -439,6 +491,8 @@ def run():
 
     print(f"[{cfg.symbol}] Waiting for start price...")
     print(f"[{cfg.symbol}] Reading from: data/start_price/{cfg.symbol}.json")
+    print(f"[{cfg.symbol}] Entry mode     : CLOSE-CONFIRM (waits for M5 bar close)")
+    print(f"[{cfg.symbol}] Trend filter   : ACTIVE (LONG only above start, SHORT only below)")
     if SIGNAL_LOGGER:
         print(f"[{cfg.symbol}] Signal logger  : ACTIVE  → data/signal_log.csv")
     if SIGNAL_FILTER:
@@ -630,6 +684,10 @@ def run():
             now = time.time()
             if now - last_log_ts >= 30.0:
                 budget = cfg.max_daily_loss_usd - abs(min(realized, 0))
+                pending_tag = (
+                    f" | PENDING={state.pending_signal.direction}@{state.pending_bar_slot}"
+                    if state.pending_signal else ""
+                )
                 print(
                     f"[{cfg.symbol}] {session_status(cfg)} | "
                     f"Mid={mid:.2f} | "
@@ -637,6 +695,7 @@ def run():
                     f"SEntry={state.levels.short_entry:.2f} | "
                     f"Trades={state.trade_count}/{cfg.max_trades_per_day} | "
                     f"PnL=${realized:+.2f} | Budget=${budget:.0f}"
+                    f"{pending_tag}"
                 )
                 last_log_ts = now
 
@@ -646,10 +705,59 @@ def run():
                 close_all_by_magic(cfg)
                 sys.exit(42)   # watchdog treats 42 as "restart" not crash
 
-            # ── SIGNAL → FILTER → LOG → ORDER ────────────────────────────────
+            # ── CLOSE-CONFIRM: execute pending signal on next bar open ────────
+            # If a signal was detected on a previous M5 bar and we're now on
+            # a new bar, execute it immediately at the current market price.
+            if state.pending_signal is not None:
+                current_slot = _current_bar_slot()
+                if current_slot != state.pending_bar_slot:
+                    # New bar has opened — execute now
+                    sig_to_exec = state.pending_signal
+                    log_id_exec = state.pending_log_id
+                    state.pending_signal   = None
+                    state.pending_bar_slot = ""
+                    state.pending_log_id   = ""
+                    print(
+                        f"[{cfg.symbol}] CLOSE-CONFIRM EXECUTE | "
+                        f"{sig_to_exec.direction} | bar={current_slot} | "
+                        f"entry≈{sig_to_exec.entry_price:.3f}"
+                    )
+                    _handle_signal_execute(sig_to_exec, state, log_id_exec)
+                # Whether we executed or are still waiting, skip new signal detection
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            # ── SIGNAL DETECTION + TREND FILTER ──────────────────────────────
+            # Step 1: Check if price has reached an entry level
             sig = evaluate_signal(mid, state.levels, state.already_traded, cfg)
             if sig:
-                _handle_signal(sig, state)
+                # Step 2: Apply trend filter — only trade in direction of day bias
+                if not _trend_filter_ok(sig.direction, mid, state.start_price):
+                    log.debug(
+                        f"[{cfg.symbol}] TREND FILTER BLOCKED | {sig.direction} | "
+                        f"mid={mid:.3f} start={state.start_price:.3f}"
+                    )
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+                # Step 3: Pre-flight risk check before parking the pending signal
+                snap = _snapshot(state.trade_count, state.internal_pnl)
+                allowed, reason = can_place_trade(snap, cfg)
+                if not allowed:
+                    print(f"[{cfg.symbol}] BLOCKED (pre-confirm) | {reason}")
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+                # Step 4: Park signal — wait for bar close (close-confirm)
+                current_slot = _current_bar_slot()
+                state.pending_signal   = sig
+                state.pending_bar_slot = current_slot
+                state.pending_log_id   = ""   # log_id assigned at execution time
+                print(
+                    f"[{cfg.symbol}] SIGNAL DETECTED | {sig.direction} | "
+                    f"bar={current_slot} | entry={sig.entry_price:.3f} | "
+                    f"waiting for bar close (close-confirm)..."
+                )
 
             time.sleep(cfg.poll_seconds)
 

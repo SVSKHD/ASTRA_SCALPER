@@ -42,9 +42,10 @@ class StrategyConfig:
     symbol: str = "XAUUSD"
 
     # ── THRESHOLD DEFINITION ──────────────────────────────
-    threshold_pips:   float = 20.0   # 1.0× = S ± 20 (SL anchor)
-    entry_multiplier: float = 1.25   # 1.25× = S ± 25 (entry, 5 pips above breakout)
-    exit_multiplier:  float = 2.0    # 2.0×  = S ± 40 (TP, 15 pips above entry)
+    # CHANGE THESE 3 LINES:
+    threshold_pips: float = 19.0  # was 20.0
+    entry_multiplier: float = 1.263158  # was 1.25  → S ± 24 pips (5 pips above threshold)
+    exit_multiplier: float = 2.052632  # was 2.0   → S ± 39 pips (15 pips above entry)
 
     # ── DOLLAR TARGETS ────────────────────────────────────
     sl_dollar_target: float = 200.0  # $200 SL per trade → lot = 0.4
